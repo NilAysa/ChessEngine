@@ -23,5 +23,11 @@ add_executable(chess_sophia
 
 
 target_include_directories(chess_sophia PRIVATE engine)
+find_package(OpenMP REQUIRED)
+
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(chess_sophia PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
 
 

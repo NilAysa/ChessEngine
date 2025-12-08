@@ -21,12 +21,17 @@ int SEARCH_NODES_SEARCHED = 0;
 Move SEARCH_BEST_MOVE{};
 int _DEPTH;
 
+// NOVO: koliko je niti stvarno korišteno u zadnjoj pretrazi
+int SEARCH_THREADS_USED = 1;
+
 // Sekvencijalna verzija pretrage koju koristimo kada nema smisla
 // ukljuciti niti (mala dubina ili 1 thread). Ovo je originalni kod.
 static int search_sequential(Board board, int depth) {
     SEARCH_BEST_MOVE = Move{};
     SEARCH_NODES_SEARCHED = 0;
     _DEPTH = depth;
+    SEARCH_THREADS_USED = 1;   // sekvencijalno
+
     return alphabeta(board, depth, MIN_EVAL, MAX_EVAL);
 }
 
@@ -36,7 +41,7 @@ int search(Board board, int depth) {
     // Ako nema OpenMP podrške, ostajemo potpuno sekvencijalni
     return search_sequential(board, depth);
 #else
-    // Procjena ima li smisla uopšte paliti paralelizaciju
+    // Saznamo koliko nam je niti OpenMP realno dao
     int numThreads = 1;
 #pragma omp parallel
     {
@@ -44,10 +49,14 @@ int search(Board board, int depth) {
         numThreads = omp_get_num_threads();
     }
 
+    // Ako je dubina mala ili imamo samo jednu nit, ne koristi se paralelizacija
     if (depth <= 3 || numThreads <= 1) {
-        // Za plitke dubine ili 1 thread – nema koristi od paralelizacije
+        SEARCH_THREADS_USED = 1;
         return search_sequential(board, depth);
     }
+
+    // Inače ćemo stvarno koristiti sve niti na rootu
+    SEARCH_THREADS_USED = numThreads;
 
     // Root-paralelizacija inspirisana PV-split/YBWC pristupom:
     //  - prvi najbolji potez pretražujemo sekvencijalno (da dobijemo dobar alpha)
@@ -141,9 +150,12 @@ int search(Board board, int depth) {
             Board child = board;
             pushMove(&child, moves[i]);
 
+            // sigurno čitanje alpha kroz kritičnu sekciju (MSVC nema atomic read)
             int curAlpha;
-#pragma omp atomic read
-            curAlpha = alpha;
+#pragma omp critical(alpha_read)
+            {
+                curAlpha = alpha;
+            }
 
             int childEval = -alphabeta(child, depth - 1, -beta, -curAlpha);
 
@@ -151,14 +163,17 @@ int search(Board board, int depth) {
                 localBestEval = childEval;
                 localBestMove = moves[i];
 
-                int newAlpha = childEval;
-#pragma omp atomic
-                if (newAlpha > alpha)
-                    alpha = newAlpha;
+                // siguran update alpha
+#pragma omp critical(alpha_update)
+                {
+                    if (childEval > alpha)
+                        alpha = childEval;
+                }
             }
         }
 
-#pragma omp critical
+        // Merge rezultata niti
+#pragma omp critical(best_update)
         {
             if (localBestEval > eval) {
                 eval = localBestEval;

@@ -2,6 +2,7 @@
 #include <string>
 #include <cstring>
 #include <ctime>
+#include <cctype>   // zbog std::isdigit
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -21,11 +22,13 @@ void parsePosition(const std::string& command, Board* board);
 void getBestMove(Board board, int depth);
 void printEngineInfo();
 
-const char* AUTHOR = "Bartek Spitza";
-const char* ENGINE_NAME = "Sophia";
-
 // UCI opcija: broj niti
 int UCI_THREADS = 1;
+
+// Iz search.cpp
+extern int SEARCH_NODES_SEARCHED;
+extern int SEARCH_THREADS_USED;
+extern Move SEARCH_BEST_MOVE;
 
 int main() {
     // Init engine
@@ -76,9 +79,11 @@ int main() {
                     size_t i = 0;
                     while (i < after.size() && after[i] == ' ')
                         ++i;
-                    if (i < after.size() && std::isdigit(static_cast<unsigned char>(after[i]))) {
+
+                    if (i < after.size() &&
+                        std::isdigit(static_cast<unsigned char>(after[i]))) {
                         int threads = std::stoi(after.substr(i));
-                        if (threads < 1) threads = 1;
+                        if (threads < 1)  threads = 1;
                         if (threads > 64) threads = 64;
                         UCI_THREADS = threads;
 #ifdef _OPENMP
@@ -103,7 +108,8 @@ int main() {
                 while (i < afterDepth.size() && afterDepth[i] == ' ')
                     ++i;
 
-                if (i < afterDepth.size() && std::isdigit((unsigned char)afterDepth[i])) {
+                if (i < afterDepth.size() &&
+                    std::isdigit(static_cast<unsigned char>(afterDepth[i]))) {
                     depth = std::stoi(afterDepth.substr(i));
                 }
             }
@@ -163,13 +169,16 @@ void getBestMove(Board board, int depth) {
     double time_ms = (end - start) * 1000.0;
 #else
     std::clock_t end = std::clock();
-    double time_ms = (double)(end - start) / CLOCKS_PER_SEC * 1000.0;
+    double time_ms =
+        static_cast<double>(end - start) / CLOCKS_PER_SEC * 1000.0;
 #endif
 
     std::cout << "info depth " << depth
         << " time " << static_cast<int>(time_ms)
         << " nodes " << SEARCH_NODES_SEARCHED
-        << " score cp " << eval << "\n";
+        << " score cp " << eval
+        << " threads " << SEARCH_THREADS_USED   // STVARNO korišten broj niti
+        << "\n";
 
     char san[6]{};
     moveToSan(SEARCH_BEST_MOVE, san);
@@ -177,8 +186,6 @@ void getBestMove(Board board, int depth) {
 }
 
 void printEngineInfo() {
-    std::cout << "id name " << ENGINE_NAME << "\n";
-    std::cout << "id author " << AUTHOR << "\n";
     std::cout << "option name Threads type spin default 1 min 1 max 64\n";
     std::cout << "uciok\n";
 }
