@@ -15,7 +15,6 @@ add_executable(chess_sophia
     engine/moveorderer.cpp
     engine/san.cpp
     engine/search.cpp
-    engine/tt.cpp
     engine/zobrist.cpp
     engine/uci.cpp
     engine/utils.cpp

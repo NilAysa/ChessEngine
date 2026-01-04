@@ -12,7 +12,6 @@
 #include "bitboards.hpp"
 #include "movegen.hpp"
 #include "evaluation.hpp"
-#include "tt.hpp"
 #include "experience.hpp"
 
 

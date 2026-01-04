@@ -18,6 +18,10 @@ struct MctsNode {
     bool terminal = false;
     int  terminalResult = UN_DETERMINED;
 
+    double prior = 0.0;          // P za PUCT (0..1), root-perspektiva nije bitna
+    int initialUnexpanded = 0;   // koliko je poteza bilo na početku (za rank prior)
+    double priorNorm = 1.0;      // normalizacija (harmonic sum)
+
     std::vector<Move> unexpanded;
     std::vector<std::unique_ptr<MctsNode>> children;
 
@@ -54,6 +58,8 @@ private:
     double terminalValue(int gameResult) const;
     double staticEvalRootPerspective(const Board& b) const;
     double evaluateLeaf_OnePlyMinimax(const Board& b);
+    double qsearchCaptures(const Board& b, int depthLeft);
+
 
     MctsNode* selectChildUCB(MctsNode* node) const;
 

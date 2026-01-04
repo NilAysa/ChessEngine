@@ -16,44 +16,22 @@ static const int ATTACKERS[] = {
     100, 200, 300, 400, 500, 600    // crne
 };
 
-static const int MAX_MOVE_SCORE = 100000;
 static const int MVV_LVA_PAWN_EXCHANGE = (100 * 16) - 100;
 
-static inline bool moves_are_equal(const Move& a, const Move& b) {
-    return a.fromSquare == b.fromSquare &&
-        a.toSquare == b.toSquare &&
-        a.promotion == b.promotion;
-}
-
-void score_moves(const Board& board, const TTEntry& entry, Move* moves, int cmoves) {
-    Move pvMove{};
-    bool hasPvMove = false;
-
-    // Ako TT unosi imaju isti hash i nije čisti UPPER bound, tretiraj kao PV move.
-    if (board.hash == entry.zobrist && entry.nodeType < UPPER) {
-        pvMove = entry.move;
-        hasPvMove = true;
-    }
-
+void score_moves(const Board& board, Move* moves, int cmoves) {
     Bitboard enemyOcc = board.turn ? board.occupancyBlack : board.occupancyWhite;
 
     for (int mi = 0; mi < cmoves; ++mi) {
         Move& m = moves[mi];
         m.score = 0;
 
-        // 1) TT/PV potez na vrh.
-        if (hasPvMove && moves_are_equal(pvMove, m)) {
-            m.score = MAX_MOVE_SCORE;
-            continue;
-        }
-
-        // 2) En passant kao specijalni capture (ciljno polje prazno, ali vrijedi kao uzimanje pješaka).
+        // 1) En passant kao specijalni capture (ciljno polje prazno, ali vrijedi kao uzimanje pješaka).
         if (board.epSquare == m.toSquare) {
             m.score = MVV_LVA_PAWN_EXCHANGE;
             continue;
         }
 
-        // 3) Običan capture? (cilj zauzet protivničkom figurom)
+        // 2) Običan capture? (cilj zauzet protivničkom figurom)
         const bool isCapture = (enemyOcc & SQUARE_BITBOARDS[m.toSquare]) != 0;
         if (isCapture) {
             int capturedPiece = -1;
@@ -76,7 +54,7 @@ void score_moves(const Board& board, const TTEntry& entry, Move* moves, int cmov
             continue;
         }
 
-        // 4) Tihi potez (score ostaje 0) — kasnije možeš dodati killers/history.
+        // 3) Tihi potez (score ostaje 0) — kasnije možeš dodati killers/history.
     }
 }
 
