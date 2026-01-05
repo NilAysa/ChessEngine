@@ -9,6 +9,8 @@
 #include "evaluation.hpp"
 #include "moveorderer.hpp"
 #include "bitboards.hpp" // SQUARE_BITBOARDS
+#include "batch_eval.hpp"
+
 
 static constexpr double PW_A = 1.5; // jačina widening-a (1.0–2.5 je normalno)
 
@@ -110,7 +112,7 @@ double MctsSearch::terminalValue(int gameResult) const {
 }
 
 double MctsSearch::staticEvalRootPerspective(const Board& b) const {
-    int evWhite = evaluate(b, UN_DETERMINED);
+    int evWhite = evaluateLeaf(b, UN_DETERMINED);
     return (rootTurn == WHITE) ? (double)evWhite : (double)-evWhite;
 }
 
@@ -130,12 +132,23 @@ double MctsSearch::evaluateLeaf_OnePlyMinimax(const Board& b) {
         ? -std::numeric_limits<double>::infinity()
         : std::numeric_limits<double>::infinity();
 
+    // 1) Napravi sve child boardove
+    std::vector<Board> childBoards;
+    childBoards.reserve((size_t)n);
+
     for (int i = 0; i < n; ++i) {
         Board child = tmp;
         pushMove(&child, moves[i]);
+        childBoards.push_back(child);
+    }
 
-        double v = staticEvalRootPerspective(child);
+    // 2) Batch evaluacija (CPU sada, GPU kasnije)
+    std::vector<double> scores((size_t)n, 0.0);
+    batchEvaluateRootPerspective(childBoards.data(), n, rootTurn, scores.data());
 
+    // 3) Minimax (root perspective)
+    for (int i = 0; i < n; ++i) {
+        double v = scores[(size_t)i];
         if (rootToMove) {
             if (v > best) best = v;
         }
@@ -143,6 +156,7 @@ double MctsSearch::evaluateLeaf_OnePlyMinimax(const Board& b) {
             if (v < best) best = v;
         }
     }
+
 
     if (!std::isfinite(best))
         best = staticEvalRootPerspective(tmp);

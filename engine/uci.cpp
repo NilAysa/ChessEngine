@@ -13,6 +13,7 @@
 #include "movegen.hpp"
 #include "evaluation.hpp"
 #include "experience.hpp"
+#include "nnue.hpp"
 
 
 void parsePosition(const std::string& command, Board* board);
@@ -29,6 +30,7 @@ int main() {
     initBitboards();
     initMoveGeneration();
     initEvaluation();
+    initNNUE();
     std::cout << "info string book file: experience_book.bin\n";
     ExperienceBook::instance().load("experience_book.bin");
 

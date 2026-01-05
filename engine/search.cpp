@@ -9,7 +9,7 @@ Move SEARCH_BEST_MOVE{};
 static int depthToIterations(int depth) {
     if (depth < 1) depth = 1;
     if (depth > 25) depth = 25;        // sigurnosni clamp
-    const int base = 8000;             // 6000–12000 po brzini
+    const int base = 3000;             // 6000–12000 po brzini
     return base * depth * depth;
 }
 

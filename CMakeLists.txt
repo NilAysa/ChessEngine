@@ -19,7 +19,9 @@ add_executable(chess_sophia
     engine/uci.cpp
     engine/utils.cpp
     engine/mcts.cpp
-    engine/experience.cpp)
+    engine/experience.cpp
+    engine/batch_eval.cpp
+    engine/nnue.cpp)
 
 
 target_include_directories(chess_sophia PRIVATE engine)

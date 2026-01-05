@@ -1,80 +1,11 @@
 ﻿#include "evaluation.hpp"
 #include "board.hpp"
 #include "utils.hpp"
+#include "nnue.hpp"
+#include "pst_tables.hpp"
 
 
-// vrijednosti pojedinacnih tipova figura u igri opcenito
-const int PIECE_VALUES[] = {
-    100, 320, 330, 500, 900, 2000,
-   -100,-320,-330,-500,-900,-2000 //za crne tj protivnicke figure pa su zato negativne
-};
-
-// ocjena koliko je pogodno svako polje na ploci za odredjenu figuru
-const int PAWN_W_PST[64] = {
-     0,  0,  0,  0,  0,  0,  0,  0,
-     5, 10, 10,-20,-20, 10, 10,  5,
-     5, -5,-10,  0,  0,-10, -5,  5,
-     0,  0,  0, 20, 20,  0,  0,  0,
-     5,  5, 10, 25, 25, 10,  5,  5,
-    10, 10, 20, 30, 30, 20, 10, 10,
-    50, 50, 50, 50, 50, 50, 50, 50,
-     0,  0,  0,  0,  0,  0,  0,  0
-};
-
-const int KNIGHT_W_PST[64] = {
-   -50,-40,-30,-30,-30,-30,-40,-50,
-   -40,-20,  0,  5,  5,  0,-20,-40,
-   -30,  5, 10, 15, 15, 10,  5,-30,
-   -30,  0, 15, 20, 20, 15,  0,-30,
-   -30,  5, 15, 20, 20, 15,  5,-30,
-   -30,  0, 10, 15, 15, 10,  0,-30,
-   -40,-20,  0,  0,  0,  0,-20,-40,
-   -50,-40,-30,-30,-30,-30,-40,-50
-};
-
-const int BISHOP_W_PST[64] = {
-   -20,-10,-10,-10,-10,-10,-10,-20,
-   -10,  5,  0,  0,  0,  0,  5,-10,
-   -10, 10, 10, 10, 10, 10, 10,-10,
-   -10,  0, 10, 10, 10, 10,  0,-10,
-   -10,  5,  5, 10, 10,  5,  5,-10,
-   -10,  0,  5, 10, 10,  5,  0,-10,
-   -10,  0,  0,  0,  0,  0,  0,-10,
-   -20,-10,-10,-10,-10,-10,-10,-20
-};
-
-const int ROOK_W_PST[64] = {
-     0,  0,  5, 10, 10,  5,  0,  0,
-    -5,  0,  0,  0,  0,  0,  0, -5,
-    -5,  0,  0,  0,  0,  0,  0, -5,
-    -5,  0,  0,  0,  0,  0,  0, -5,
-    -5,  0,  0,  0,  0,  0,  0, -5,
-    -5,  0,  0,  0,  0,  0,  0, -5,
-     5, 10, 10, 10, 10, 10, 10,  5,
-     0,  0,  0,  0,  0,  0,  0,  0
-};
-
-const int QUEEN_W_PST[64] = {
-   -20,-10,-10, -5, -5,-10,-10,-20,
-   -10,  0,  5,  0,  0,  0,  0,-10,
-   -10,  5,  5,  5,  5,  5,  0,-10,
-     0,  0,  5,  5,  5,  5,  0, -5,
-    -5,  0,  5,  5,  5,  5,  0, -5,
-   -10,  0,  5,  5,  5,  5,  0,-10,
-   -10,  0,  0,  0,  0,  0,  0,-10,
-   -20,-10,-10, -5, -5,-10,-10,-20
-};
-
-const int KING_W_PST[64] = {
-    20, 30, 10,  0,  0, 10, 30, 20,
-    20, 20,  0,  0,  0,  0, 20, 20,
-   -10,-20,-20,-20,-20,-20,-20,-10,
-   -20,-30,-30,-40,-40,-30,-30,-20,
-   -30,-40,-40,-50,-50,-40,-40,-30,
-   -30,-40,-40,-50,-50,-40,-40,-30,
-   -30,-40,-40,-50,-50,-40,-40,-30,
-   -30,-40,-40,-50,-50,-40,-40,-30
-};
+bool USE_NNUE = true;
 
 // za crne se uzima sve isto samo preslikano po horizontalnoj osi
 int PAWN_B_PST[64];
@@ -100,7 +31,7 @@ void initEvaluation() {
     }
 }
 //racuna numericku vrijednost pozicije za neku figuru
-int evaluate(const Board& board, int result) {
+static int evaluateClassic(const Board& board, int result) {
     //ako je prethodnim potezom vec zavrsena igra samo vraca rezultat
     if (result == DRAW) return 0;
     if (result == WHITE_WIN) return MAX_EVAL;
@@ -137,3 +68,24 @@ int evaluate(const Board& board, int result) {
 
     return eval;
 }
+
+int evaluate(const Board& board, int result) {
+    // NAMJERNO: uvijek classic (stabilno za rollout / sve osim leaf-a)
+    return evaluateClassic(board, result);
+}
+
+int evaluateLeaf(const Board& board, int result) {
+    int classic = evaluateClassic(board, result);
+
+    if (!(USE_NNUE && nnueHasWeights())) {
+        return classic;
+    }
+
+    int nn = nnueEvaluateWhitePerspective(board);
+
+    // 25% NNUE na startu
+    const int a = 250; // permille: 0..1000
+    return (classic * (1000 - a) + nn * a) / 1000;
+}
+
+
