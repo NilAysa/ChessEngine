@@ -18,34 +18,29 @@ void batchEvaluateRootPerspective(const Board* boards, int n, int rootTurn, doub
     if (!tried) {
         tried = true;
         cudaOK = nnueCudaInit();
-        if (cudaOK) {
-            std::cout << "info string CUDA path compiled: USE_CUDA_NNUE=ON\n";
-        }
-        else {
-            std::cout << "info string CUDA init failed -> CPU fallback\n";
-        }
+        std::cout << "info string CUDA NNUE init = " << (cudaOK ? "OK" : "FAILED") << "\n";
     }
 
-    // CUDA path: use GPU NNUE only for now (simple correctness test)
-    if (cudaOK) {
-        std::vector<int> nnCp(n);
-        if (nnueCudaEvaluateBatchWhite(boards, n, nnCp.data())) {
-            // (Optional) one-time print so you KNOW GPU is used
-            static bool printed = false;
-            if (!printed) {
-                printed = true;
-                std::cout << "info string CUDA batch NNUE ACTIVE\n";
-            }
+    // Prag: ispod ovoga često je CPU brži (GPU overhead)
+    constexpr int GPU_THRESHOLD = 64;
 
+    if (cudaOK && n >= GPU_THRESHOLD) {
+        static bool printedGPU = false;
+        if (!printedGPU) {
+            printedGPU = true;
+            std::cout << "info string CUDA NNUE batch eval ACTIVE (async+pinned)\n";
+        }
+
+        std::vector<int> cp((size_t)n);
+        if (nnueCudaEvaluateBatchWhite(boards, n, cp.data())) {
             for (int i = 0; i < n; ++i) {
-                int whiteScore = nnCp[i]; // white-perspective
-                outScores[i] = (rootTurn == WHITE) ? (double)whiteScore : (double)-whiteScore;
+                int evWhite = cp[i];
+                outScores[i] = (rootTurn == WHITE) ? (double)evWhite : (double)-evWhite;
             }
             return;
         }
-        else {
-            std::cout << "info string CUDA batch failed -> CPU fallback\n";
-        }
+        // ako CUDA faila u runtime-u, padni na CPU
+        cudaOK = false;
     }
 #endif
 
@@ -61,3 +56,4 @@ void batchEvaluateRootPerspective(const Board* boards, int n, int rootTurn, doub
         outScores[i] = (rootTurn == WHITE) ? (double)evWhite : (double)-evWhite;
     }
 }
+

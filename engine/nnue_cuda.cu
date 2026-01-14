@@ -3,50 +3,61 @@
 #include <cstdio>
 #include <vector>
 #include <cmath>
+#include <cstring>
 
 #include "typedefs.hpp"
 #include "nnue_cuda.hpp"
+
+// reuse your generated weights
 #include "nnue_weights_generated.hpp"
 
-// ------------------------------------------------------------
-// Device buffers (weights)
-// W1T: [INPUT_DIM][HIDDEN_DIM]  (transponovano radi koalesiranja)
-static float* d_W1T = nullptr; // 781 * 128
-static float* d_B1  = nullptr; // 128
-static float* d_W2  = nullptr; // 128
-static float* d_B2  = nullptr; // 1
-
-// device buffers (boards + outputs)
-static Board* d_boards = nullptr;
-static int*   d_outCp  = nullptr;
-static int    capBoards = 0;
-
-static inline bool ck(cudaError_t e, const char* msg) {
+static inline bool ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
-        printf("CUDA error: %s -> %s\n", msg, cudaGetErrorString(e));
+        std::printf("[CUDA] %s failed: %s\n", what, cudaGetErrorString(e));
         return false;
     }
     return true;
 }
 
-// --- helpers ---
-__device__ __forceinline__ int sqEngineToPy_dev(int sq_engine) { return sq_engine ^ 7; }
-__device__ __forceinline__ int ctz64_dev(unsigned long long x) { return __ffsll((long long)x) - 1; }
+// --- device buffers for weights ---
+static float* d_W1 = nullptr;  // [128 * 781]
+static float* d_B1 = nullptr;  // [128]
+static float* d_W2 = nullptr;  // [128]
+static float* d_B2 = nullptr;  // [1]
 
-// Collect active indices into local array (max 64)
-__device__ int collectActive(const Board& b, int* act) {
+// --- device buffers for input/output (resizable) ---
+static Board* d_boards = nullptr;
+static int*   d_outCp  = nullptr;
+static int    cap      = 0;
+
+// --- host pinned staging buffers (for true async memcpy) ---
+static Board* h_boardsPinned = nullptr;
+static int*   h_outPinned    = nullptr;
+static int    h_cap          = 0;
+
+// --- one persistent stream ---
+static cudaStream_t g_stream = nullptr;
+
+static bool g_inited = false;
+
+static __device__ __forceinline__ float relu(float x) { return x > 0.0f ? x : 0.0f; }
+
+constexpr int NNUE_INPUT_DIM  = 781;
+constexpr int NNUE_HIDDEN_DIM = 128;
+
+// Build sparse active feature indices (same logic as your existing code)
+__device__ __forceinline__ int buildActive(const Board& b, int* act) {
     int cnt = 0;
 
-    auto addPiecesPlane = [&](unsigned long long bb, int planeBase) {
+    auto addPiecesPlane = [&](Bitboard bb, int base) {
         while (bb) {
-            int sq_engine = ctz64_dev(bb);
-            int sq_py = sqEngineToPy_dev(sq_engine);
-            act[cnt++] = planeBase + sq_py;
+            int sq = __ffsll((unsigned long long)bb) - 1;
             bb &= (bb - 1);
-            if (cnt >= 64) return; // sigurnosno
+            act[cnt++] = base + sq;
         }
     };
 
+    // 12 planes * 64 = 768
     addPiecesPlane(b.pawn_W,   0 * 64);
     addPiecesPlane(b.knight_W, 1 * 64);
     addPiecesPlane(b.bishop_W, 2 * 64);
@@ -61,169 +72,157 @@ __device__ int collectActive(const Board& b, int* act) {
     addPiecesPlane(b.queen_B, 10 * 64);
     addPiecesPlane(b.king_B,  11 * 64);
 
-    // side-to-move feature: tvoj CPU kod koristi 768..; ovdje zadržimo isto
-    // (pretpostavka: WHITE=1, BLACK=0)
-    act[cnt++] = 768 + (b.turn == WHITE ? 1 : 0);
+    // STM
+    if (b.turn == WHITE) act[cnt++] = 768;
 
-    // castling (4 bita)
-    // mapiraj na 769..772
-    if (b.castling & 1) act[cnt++] = 769; // K
-    if (b.castling & 2) act[cnt++] = 770; // Q
-    if (b.castling & 4) act[cnt++] = 771; // k
-    if (b.castling & 8) act[cnt++] = 772; // q
+    // castling bits (K,Q,k,q) => 769..772
+    if (b.castling & 0b0001) act[cnt++] = 769;
+    if (b.castling & 0b0010) act[cnt++] = 770;
+    if (b.castling & 0b0100) act[cnt++] = 771;
+    if (b.castling & 0b1000) act[cnt++] = 772;
 
-    // ep file: (tvoj CPU kod je imao 773..780)
-    if (b.epSquare >= 0) {
-        int file = (b.epSquare & 7);
+    // en-passant file (if exists) => 773..780 (8 files)
+    if (b.epSquare >= 0 && b.epSquare < 64) {
+        int file = b.epSquare & 7;
         act[cnt++] = 773 + file;
     }
 
     return cnt;
 }
 
-// warp reduce (sum)
-__device__ __forceinline__ float warpReduceSum(float v) {
-    // standardni butterfly; warp je 32 niti :contentReference[oaicite:10]{index=10}
-    for (int offset = 16; offset > 0; offset >>= 1)
-        v += __shfl_down_sync(0xffffffff, v, offset);
-    return v;
-}
-
-// block reduce using warpReduce + shared for warp sums
-__device__ float blockReduceSum(float v) {
-    __shared__ float warpSums[4]; // 128 threads -> 4 warpa
-
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-
-    v = warpReduceSum(v);
-    if (lane == 0) warpSums[warp] = v;
-    __syncthreads();
-
-    // warp 0 final reduce
-    float out = 0.0f;
-    if (warp == 0) {
-        out = (lane < 4) ? warpSums[lane] : 0.0f;
-        out = warpReduceSum(out);
-    }
-    return out; // validno u svim nitima (ali smisleno u warp0)
-}
-
-__global__ void nnueBatchKernelT(const Board* __restrict__ boards,
-                                 int n,
-                                 const float* __restrict__ W1T,
-                                 const float* __restrict__ B1,
-                                 const float* __restrict__ W2,
-                                 const float* __restrict__ B2,
-                                 int* __restrict__ outCp) {
-    int pos = blockIdx.x;
+__global__ void nnueBatchKernel(const Board* boards, int n,
+                                const float* W1, const float* B1,
+                                const float* W2, const float* B2,
+                                int* outCp)
+{
+    int pos = (int)blockIdx.x;
     if (pos >= n) return;
 
-    __shared__ int   act[64];
-    __shared__ int   actCnt;
+    int i = (int)threadIdx.x; // 0..127
+
+    __shared__ int   act[64];     // dovoljno za max aktivnih (tipično < 40)
+    __shared__ int   actCount;
     __shared__ float hidden[NNUE_HIDDEN_DIM];
 
-    // 1) thread0 skuplja active feature-e
-    if (threadIdx.x == 0) {
-        actCnt = collectActive(boards[pos], act);
-        if (actCnt > 64) actCnt = 64;
+    if (i == 0) {
+        actCount = buildActive(boards[pos], act);
     }
     __syncthreads();
 
-    // 2) svaki thread = jedan neuron j
-    int j = threadIdx.x; // 0..127
-    float sum = B1[j];
-
-    // KOALESIRANO: za fiksni feature, niti (j) čitaju susjedne adrese W1T[feat*128 + j] :contentReference[oaicite:11]{index=11}
-    for (int k = 0; k < actCnt; ++k) {
-        int feat = act[k];
-        sum += W1T[feat * NNUE_HIDDEN_DIM + j];
+    // Hidden neuron i: dot over sparse act
+    float sum = B1[i];
+    // NOTE: sparse -> divergent count, ali actCount je zajednički po bloku
+    for (int k = 0; k < actCount; ++k) {
+        int idx = act[k];
+        sum += W1[i * NNUE_INPUT_DIM + idx];
     }
-
-    // ReLU
-    sum = (sum > 0.0f) ? sum : 0.0f;
-    hidden[j] = sum;
+    hidden[i] = relu(sum);
     __syncthreads();
 
-    // 3) dot(W2, hidden) kao redukcija
-    float partial = W2[j] * hidden[j];
-    float dot = blockReduceSum(partial);
+    if (i == 0) {
+        float out = B2[0];
+        // W2[j] * hidden[j]
+        for (int j = 0; j < NNUE_HIDDEN_DIM; ++j) out += W2[j] * hidden[j];
 
-    // 4) thread0 upisuje output
-    if (threadIdx.x == 0) {
-        float out = B2[0] + dot;
         float cp = out * 400.0f;
-        cp = fminf(100000.0f, fmaxf(-100000.0f, cp));
+        if (cp >  100000.0f) cp =  100000.0f;
+        if (cp < -100000.0f) cp = -100000.0f;
         outCp[pos] = (int)llroundf(cp);
     }
 }
 
 bool nnueCudaInit() {
-    int devCount = 0;
-    if (cudaGetDeviceCount(&devCount) != cudaSuccess || devCount == 0) return false;
+    if (g_inited) return true;
 
-    // --- Host transpose W1 -> W1T ---
-    std::vector<float> h_W1T(NNUE_INPUT_DIM * NNUE_HIDDEN_DIM);
-    for (int h = 0; h < NNUE_HIDDEN_DIM; ++h) {
-        for (int in = 0; in < NNUE_INPUT_DIM; ++in) {
-            h_W1T[in * NNUE_HIDDEN_DIM + h] = NNUE_W1[h][in];
-        }
-    }
+    int devCount = 0;
+    if (!ck(cudaGetDeviceCount(&devCount), "cudaGetDeviceCount")) return false;
+    if (devCount == 0) return false;
+
+    // stream
+    if (!ck(cudaStreamCreate(&g_stream), "cudaStreamCreate")) return false;
 
     // allocate weights on device
-    if (!ck(cudaMalloc(&d_W1T, sizeof(float) * NNUE_INPUT_DIM * NNUE_HIDDEN_DIM), "malloc d_W1T")) return false;
-    if (!ck(cudaMalloc(&d_B1,  sizeof(float) * NNUE_HIDDEN_DIM), "malloc d_B1")) return false;
-    if (!ck(cudaMalloc(&d_W2,  sizeof(float) * NNUE_HIDDEN_DIM), "malloc d_W2")) return false;
-    if (!ck(cudaMalloc(&d_B2,  sizeof(float)), "malloc d_B2")) return false;
+    if (!ck(cudaMalloc(&d_W1, sizeof(float) * NNUE_HIDDEN_DIM * NNUE_INPUT_DIM), "malloc d_W1")) return false;
+    if (!ck(cudaMalloc(&d_B1, sizeof(float) * NNUE_HIDDEN_DIM), "malloc d_B1")) return false;
+    if (!ck(cudaMalloc(&d_W2, sizeof(float) * NNUE_HIDDEN_DIM), "malloc d_W2")) return false;
+    if (!ck(cudaMalloc(&d_B2, sizeof(float) * 1), "malloc d_B2")) return false;
 
-    if (!ck(cudaMemcpy(d_W1T, h_W1T.data(),
-                       sizeof(float) * NNUE_INPUT_DIM * NNUE_HIDDEN_DIM,
-                       cudaMemcpyHostToDevice), "cpy W1T")) return false;
-
+    if (!ck(cudaMemcpy(d_W1, NNUE_W1, sizeof(float) * NNUE_HIDDEN_DIM * NNUE_INPUT_DIM, cudaMemcpyHostToDevice), "cpy W1")) return false;
     if (!ck(cudaMemcpy(d_B1, NNUE_B1, sizeof(float) * NNUE_HIDDEN_DIM, cudaMemcpyHostToDevice), "cpy B1")) return false;
     if (!ck(cudaMemcpy(d_W2, NNUE_W2, sizeof(float) * NNUE_HIDDEN_DIM, cudaMemcpyHostToDevice), "cpy W2")) return false;
-    if (!ck(cudaMemcpy(d_B2, NNUE_B2, sizeof(float), cudaMemcpyHostToDevice), "cpy B2")) return false;
+    if (!ck(cudaMemcpy(d_B2, NNUE_B2, sizeof(float) * 1,              cudaMemcpyHostToDevice), "cpy B2")) return false;
 
-    printf("[CUDA] NNUE CUDA init OK (W1 transposed for coalescing)\n");
+    g_inited = true;
+    std::printf("[CUDA] NNUE CUDA init OK (stream + persistent buffers)\n");
     return true;
 }
 
 void nnueCudaShutdown() {
-    if (d_W1T) cudaFree(d_W1T);
-    if (d_B1)  cudaFree(d_B1);
-    if (d_W2)  cudaFree(d_W2);
-    if (d_B2)  cudaFree(d_B2);
-    d_W1T = d_B1 = d_W2 = d_B2 = nullptr;
+    if (d_W1) cudaFree(d_W1), d_W1 = nullptr;
+    if (d_B1) cudaFree(d_B1), d_B1 = nullptr;
+    if (d_W2) cudaFree(d_W2), d_W2 = nullptr;
+    if (d_B2) cudaFree(d_B2), d_B2 = nullptr;
 
-    if (d_boards) cudaFree(d_boards);
-    if (d_outCp)  cudaFree(d_outCp);
-    d_boards = nullptr; d_outCp = nullptr;
-    capBoards = 0;
+    if (d_boards) cudaFree(d_boards), d_boards = nullptr;
+    if (d_outCp)  cudaFree(d_outCp),  d_outCp  = nullptr;
+
+    if (h_boardsPinned) cudaFreeHost(h_boardsPinned), h_boardsPinned = nullptr;
+    if (h_outPinned)    cudaFreeHost(h_outPinned),    h_outPinned    = nullptr;
+
+    cap = 0;
+    h_cap = 0;
+
+    if (g_stream) cudaStreamDestroy(g_stream), g_stream = nullptr;
+
+    g_inited = false;
 }
 
+// Evaluate NNUE for a batch of boards, returns WHITE-perspective cp
 bool nnueCudaEvaluateBatchWhite(const Board* boards, int n, int* outCp) {
-    if (!boards || !outCp || n <= 0) return false;
-    if (!d_W1T || !d_B1 || !d_W2 || !d_B2) return false;
+    if (!g_inited) return false;
+    if (n <= 0) return true;
 
-    // resize device buffers if needed
-    if (n > capBoards) {
+    // Resize device buffers
+    if (n > cap) {
         if (d_boards) cudaFree(d_boards);
         if (d_outCp)  cudaFree(d_outCp);
-        d_boards = nullptr; d_outCp = nullptr;
 
         if (!ck(cudaMalloc(&d_boards, sizeof(Board) * n), "malloc d_boards")) return false;
         if (!ck(cudaMalloc(&d_outCp,  sizeof(int)   * n), "malloc d_outCp"))  return false;
-        capBoards = n;
+
+        cap = n;
     }
 
-    if (!ck(cudaMemcpy(d_boards, boards, sizeof(Board) * n, cudaMemcpyHostToDevice), "cpy boards H2D")) return false;
+    // Resize pinned host staging (for true async H2D/D2H)
+    if (n > h_cap) {
+        if (h_boardsPinned) cudaFreeHost(h_boardsPinned);
+        if (h_outPinned)    cudaFreeHost(h_outPinned);
 
-    dim3 block(NNUE_HIDDEN_DIM, 1, 1); // 128 threads
-    dim3 grid(n, 1, 1);                // 1 block per board
-    nnueBatchKernelT<<<grid, block>>>(d_boards, n, d_W1T, d_B1, d_W2, d_B2, d_outCp);
+        if (!ck(cudaMallocHost(&h_boardsPinned, sizeof(Board) * n), "cudaMallocHost boards")) return false;
+        if (!ck(cudaMallocHost(&h_outPinned,    sizeof(int)   * n), "cudaMallocHost out"))    return false;
+        h_cap = n;
+    }
 
-    if (cudaDeviceSynchronize() != cudaSuccess) return false;
-    if (!ck(cudaMemcpy(outCp, d_outCp, sizeof(int) * n, cudaMemcpyDeviceToHost), "cpy out D2H")) return false;
+    // Copy to pinned staging (CPU memcpy)
+    std::memcpy(h_boardsPinned, boards, sizeof(Board) * n);
 
+    // Async H2D
+    if (!ck(cudaMemcpyAsync(d_boards, h_boardsPinned, sizeof(Board) * n, cudaMemcpyHostToDevice, g_stream),
+            "cudaMemcpyAsync H2D boards")) return false;
+
+    // Kernel
+    dim3 block(NNUE_HIDDEN_DIM, 1, 1);
+    dim3 grid(n, 1, 1);
+    nnueBatchKernel<<<grid, block, 0, g_stream>>>(d_boards, n, d_W1, d_B1, d_W2, d_B2, d_outCp);
+    if (!ck(cudaGetLastError(), "kernel launch")) return false;
+
+    // Async D2H
+    if (!ck(cudaMemcpyAsync(h_outPinned, d_outCp, sizeof(int) * n, cudaMemcpyDeviceToHost, g_stream),
+            "cudaMemcpyAsync D2H out")) return false;
+
+    // Wait only for this stream (no global device sync)
+    if (!ck(cudaStreamSynchronize(g_stream), "cudaStreamSynchronize")) return false;
+
+    std::memcpy(outCp, h_outPinned, sizeof(int) * n);
     return true;
 }
