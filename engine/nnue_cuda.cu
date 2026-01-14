@@ -42,8 +42,6 @@ static bool g_inited = false;
 
 static __device__ __forceinline__ float relu(float x) { return x > 0.0f ? x : 0.0f; }
 
-constexpr int NNUE_INPUT_DIM  = 781;
-constexpr int NNUE_HIDDEN_DIM = 128;
 
 // Build sparse active feature indices (same logic as your existing code)
 __device__ __forceinline__ int buildActive(const Board& b, int* act) {
@@ -150,7 +148,7 @@ bool nnueCudaInit() {
     if (!ck(cudaMemcpy(d_W1, NNUE_W1, sizeof(float) * NNUE_HIDDEN_DIM * NNUE_INPUT_DIM, cudaMemcpyHostToDevice), "cpy W1")) return false;
     if (!ck(cudaMemcpy(d_B1, NNUE_B1, sizeof(float) * NNUE_HIDDEN_DIM, cudaMemcpyHostToDevice), "cpy B1")) return false;
     if (!ck(cudaMemcpy(d_W2, NNUE_W2, sizeof(float) * NNUE_HIDDEN_DIM, cudaMemcpyHostToDevice), "cpy W2")) return false;
-    if (!ck(cudaMemcpy(d_B2, NNUE_B2, sizeof(float) * 1,              cudaMemcpyHostToDevice), "cpy B2")) return false;
+    if (!ck(cudaMemcpy(d_B2, &NNUE_B2, sizeof(float), cudaMemcpyHostToDevice), "cpy B2")) return false;
 
     g_inited = true;
     std::printf("[CUDA] NNUE CUDA init OK (stream + persistent buffers)\n");
