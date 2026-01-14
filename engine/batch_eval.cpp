@@ -22,7 +22,7 @@ void batchEvaluateRootPerspective(const Board* boards, int n, int rootTurn, doub
     }
 
     // Prag: ispod ovoga često je CPU brži (GPU overhead)
-    constexpr int GPU_THRESHOLD = 64;
+    constexpr int GPU_THRESHOLD = 1;
 
     if (cudaOK && n >= GPU_THRESHOLD) {
         static bool printedGPU = false;
