@@ -28,7 +28,9 @@ void batchEvaluateRootPerspective(const Board* boards, int n, int rootTurn, doub
     // Isti faktor kao u evaluateLeaf (evaluation.cpp)
     // 25% NNUE, 75% classic
     constexpr int a = 250; // permille
-
+    
+    static bool printedValues = false;
+    
     if (cudaOK && n >= GPU_THRESHOLD) {
         static bool printedGPU = false;
         if (!printedGPU) {
@@ -56,6 +58,15 @@ void batchEvaluateRootPerspective(const Board* boards, int n, int rootTurn, doub
                 }
                 else {
                     evWhite = classic[i];
+                }
+                // DEBUG ISPIS (samo jednom)
+                if (!printedValues) {
+                    std::cout
+                        << "info string EVAL DEBUG | classic = " << classic[i]
+                        << " | nnue = " << nn[i]
+                        << " | blended = " << evWhite
+                        << "\n";
+                    printedValues = true;
                 }
 
                 outScores[i] = (rootTurn == WHITE) ? (double)evWhite : (double)-evWhite;
