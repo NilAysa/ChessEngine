@@ -51,7 +51,7 @@ __device__ __forceinline__ int buildActive(const Board& b, int* act) {
         while (bb) {
             int sq = __ffsll((unsigned long long)bb) - 1;
             bb &= (bb - 1);
-            act[cnt++] = base + sq;
+            act[cnt++] = base + (sq ^ 7);
         }
     };
 
