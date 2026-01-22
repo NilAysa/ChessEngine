@@ -25,50 +25,32 @@ void batchEvaluateRootPerspective(const Board* boards, int n, int rootTurn, doub
     // Prag: ispod ovoga često je CPU brži (GPU overhead)
     constexpr int GPU_THRESHOLD = 1;
 
-    // Isti faktor kao u evaluateLeaf (evaluation.cpp)
-    // 25% NNUE, 75% classic
+    // 25% NNUE, 75% classic (identično evaluateLeaf u evaluation.cpp)
     constexpr int a = 250; // permille
-    
+
     static bool printedValues = false;
-    
-    if (cudaOK && n >= GPU_THRESHOLD) {
+
+    const bool useNN = (USE_NNUE && nnueHasWeights());
+
+    if (cudaOK && useNN && n >= GPU_THRESHOLD) {
         static bool printedGPU = false;
         if (!printedGPU) {
             printedGPU = true;
-            std::cout << "info string CUDA NNUE batch eval ACTIVE (classic+nnue blend, async+pinned)\n";
+            std::cout << "info string CUDA batch eval ACTIVE (classic+nnue BLENDED ON GPU, async+pinned)\n";
         }
 
-        // 1) CPU classic evaluacija (jeftino)
-        std::vector<int> classic((size_t)n);
-        for (int i = 0; i < n; ++i) {
-            classic[i] = evaluate(boards[i], UN_DETERMINED); // evaluate() je uvijek classic
-        }
+        // GPU radi i classic i NNUE i blending -> vraća WHITE-perspective cp
+        std::vector<int> blended((size_t)n);
+        if (nnueCudaEvaluateBatchBlendedWhite(boards, n, a, blended.data())) {
 
-        // 2) GPU NNUE evaluacija (skupo -> GPU)
-        std::vector<int> nn((size_t)n);
-        if (nnueCudaEvaluateBatchWhite(boards, n, nn.data())) {
-
-            const bool useNN = (USE_NNUE && nnueHasWeights());
+            // DEBUG ISPIS (samo jednom)
+            if (!printedValues && n > 0) {
+                std::cout << "info string EVAL DEBUG | blended[0] = " << blended[0] << "\n";
+                printedValues = true;
+            }
 
             for (int i = 0; i < n; ++i) {
-                int evWhite;
-                if (useNN) {
-                    // 3) identično evaluateLeaf(): classic + 25% NNUE
-                    evWhite = (classic[i] * (1000 - a) + nn[i] * a) / 1000;
-                }
-                else {
-                    evWhite = classic[i];
-                }
-                // DEBUG ISPIS (samo jednom)
-                if (!printedValues) {
-                    std::cout
-                        << "info string EVAL DEBUG | classic = " << classic[i]
-                        << " | nnue = " << nn[i]
-                        << " | blended = " << evWhite
-                        << "\n";
-                    printedValues = true;
-                }
-
+                int evWhite = blended[i];
                 outScores[i] = (rootTurn == WHITE) ? (double)evWhite : (double)-evWhite;
             }
             return;
