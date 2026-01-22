@@ -56,7 +56,7 @@ private:
 
     // Koliko leaf-ova skupljamo prije GPU batch evaluacije.
     // 64 je dobar default za NNUE kernel (dovoljno da saturira GPU, a da ne ubije latenciju).
-    int batchSize = 1;
+    int batchSize = 64;
 
     double C = 1.2;
     int mateScore = 100000;
