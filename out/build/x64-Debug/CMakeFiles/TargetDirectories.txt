@@ -1,0 +1,3 @@
+C:/Users/Korisnik/Desktop/ChessCpp_mcts/out/build/x64-Debug/CMakeFiles/chess_sophia.dir
+C:/Users/Korisnik/Desktop/ChessCpp_mcts/out/build/x64-Debug/CMakeFiles/edit_cache.dir
+C:/Users/Korisnik/Desktop/ChessCpp_mcts/out/build/x64-Debug/CMakeFiles/rebuild_cache.dir

@@ -1,1 +1,0 @@
-Fixed GPU NNUE batch evaluation to preserve the original leaf evaluation logic by blending classic evaluation with NNUE, identical to the CPU version, while accelerating only the NNUE computation using CUDA.

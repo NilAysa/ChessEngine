@@ -1,0 +1,26 @@
+# ninja log v6
+89	356	7901347064500835	CMakeFiles/chess_sophia.dir/engine/magics.cpp.obj	7ab7f9e58f554344
+26	451	7901347063882774	CMakeFiles/chess_sophia.dir/engine/bitboards.cpp.obj	11579ac8a6bfec53
+116	564	7901347064775666	CMakeFiles/chess_sophia.dir/engine/moveorderer.cpp.obj	2d655d8492d45d38
+127	3844	7901347064889163	CMakeFiles/chess_sophia.dir/engine/san.cpp.obj	82e7e38f91cd0370
+61	3938	7901347064206261	CMakeFiles/chess_sophia.dir/engine/fen.cpp.obj	1b8807ceb83e8b92
+105	3996	7901347064649191	CMakeFiles/chess_sophia.dir/engine/movegen.cpp.obj	336c3f321f67a852
+50	4108	7901347064107325	CMakeFiles/chess_sophia.dir/engine/evaluation.cpp.obj	a1dceca347f79a4f
+39	4200	7901347064003661	CMakeFiles/chess_sophia.dir/engine/board.cpp.obj	463736e5cfcb78b6
+359	5065	7901347067201133	CMakeFiles/chess_sophia.dir/engine/uci.cpp.obj	7bb8ca453619acd3
+154	5116	7901347065149319	CMakeFiles/chess_sophia.dir/engine/zobrist.cpp.obj	25c6651659cea0cb
+140	5140	7901347065008290	CMakeFiles/chess_sophia.dir/engine/search.cpp.obj	354837298da24c00
+451	5160	7901347068129916	CMakeFiles/chess_sophia.dir/engine/utils.cpp.obj	9e5cbc3987abeff8
+565	5956	7901347069257000	CMakeFiles/chess_sophia.dir/engine/mcts.cpp.obj	e5caf52f33cb7aa5
+3997	6487	7901347103584145	CMakeFiles/chess_sophia.dir/engine/nnue.cpp.obj	5fb3244e42c0f63b
+3939	6723	7901347102991745	CMakeFiles/chess_sophia.dir/engine/batch_eval.cpp.obj	3627df104579213e
+3846	7403	7901347102077607	CMakeFiles/chess_sophia.dir/engine/experience.cpp.obj	6c6ad9bd23c59ec9
+7403	8136	7901347137615080	chess_sophia.exe	88005c9d09d608c6
+86	1422	7901352592516494	CMakeFiles/chess_sophia.dir/engine/evaluation.cpp.obj	a1dceca347f79a4f
+1424	1744	7901352605898250	chess_sophia.exe	88005c9d09d608c6
+97	1781	7902672569225468	CMakeFiles/chess_sophia.dir/engine/batch_eval.cpp.obj	3627df104579213e
+1783	2066	7902672586060228	chess_sophia.exe	88005c9d09d608c6
+69	2124	7902704247372582	CMakeFiles/chess_sophia.dir/engine/batch_eval.cpp.obj	3627df104579213e
+2126	2588	7902704267937323	chess_sophia.exe	88005c9d09d608c6
+67	2115	7902711025525439	CMakeFiles/chess_sophia.dir/engine/batch_eval.cpp.obj	3627df104579213e
+2117	2435	7902711046010226	chess_sophia.exe	88005c9d09d608c6

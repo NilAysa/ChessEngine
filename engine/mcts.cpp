@@ -15,15 +15,20 @@
 static constexpr double PW_A = 1.5; // jačina widening-a (1.0–2.5 je normalno)
 
 
-MctsSearch::MctsSearch(const Board & root, int rootTurn_, int iterations_)
+MctsSearch::MctsSearch(const Board& root, int rootTurn_, int iterations_)
     : rootTurn(rootTurn_), iterations(iterations_) {
     rootNode = std::make_unique<MctsNode>(root);
 }
 
 void MctsSearch::run() {
-    for (int i = 0; i < iterations; ++i) {
-        simulateOnce();
+    // Batched leaf-parallel MCTS (CPU tree + GPU batch evaluacija leaf-ova).
+    // Ako neko želi debug single-step, može postaviti batchSize=1 u kodu.
+    if (batchSize <= 1) {
+        for (int i = 0; i < iterations; ++i) simulateOnce();
+        return;
     }
+
+    runBatched();
 }
 
 Move MctsSearch::bestMove() const {
@@ -272,42 +277,29 @@ static inline int positional_prior_bonus(const Board& b, const Move& m) {
     // širi centar: c3..f6 okvir
     if (ft >= 2 && ft <= 5 && rt >= 2 && rt <= 5) bonus += 6;
 
-    // 4) Penalizuj rani rook/queen “shuffle” sa početnih polja (osim ako je capture)
-    if (!isCapture) {
-        // bijeli: rooks a1/h1 (0/7), queen d1 (3)
-        // crni: rooks a8/h8 (56/63), queen d8 (59)
-        if (pt == 3) { // rook
-            if ((m.pieceType < 6 && (from == 0 || from == 7)) ||
-                (m.pieceType >= 6 && (from == 56 || from == 63))) {
-                bonus -= 14;
-            }
+    // 4) Penalizuj rani rook/queen 'šetanje' (osim ako je capture)
+    if (!isCapture && (pt == 3 || pt == 4)) { // rook ili queen
+        // ako se pomjera u prvih par rankova svoje strane, malo kazni
+        if (m.pieceType < 6) { // white
+            if (rf <= 1 && rt <= 2) bonus -= 8;
         }
-        if (pt == 4) { // queen
-            if ((m.pieceType < 6 && from == 3) ||
-                (m.pieceType >= 6 && from == 59)) {
-                bonus -= 10;
-            }
+        else { // black
+            if (rf >= 6 && rt >= 5) bonus -= 8;
         }
     }
 
-    // 5) Penalizuj “flank pawn push” a/h pješak rano (osim capture)
-    // bijeli pawn start rank 1, crni start rank 6
-    if (!isCapture && pt == 0) {
-        bool isFlank = (ff == 0 || ff == 7);
-        if (isFlank) {
-            if ((m.pieceType < 6 && rf == 1) || (m.pieceType >= 6 && rf == 6)) {
-                bonus -= 8; // blago, da ne ubije dobre planove
-            }
-        }
+    // 5) Dvostruki pawn push malo nagradi u openingu
+    if (pt == 0 && !isCapture) { // pawn
+        int dr = std::abs(rt - rf);
+        if (dr == 2) bonus += 6;
     }
 
-    // 6) Mali bonus za promociju (ako postoji u Move)
-    if (m.promotion != 0) bonus += 20;
+    // clamp (da bonus ne divlja)
+    if (bonus > 60) bonus = 60;
+    if (bonus < -40) bonus = -40;
 
     return bonus;
 }
-
-
 
 void MctsSearch::ensureInitialized(MctsNode* node) {
     if (!node || node->initialized) return;
@@ -328,51 +320,15 @@ void MctsSearch::ensureInitialized(MctsNode* node) {
 
     node->terminal = false;
 
-    // 1) bazni ordering iz moveorderer-a (bez TT)
+    // 1) bazni ordering iz moveorderer-a
     score_moves(b, moves, n);
 
-    // DEBUG: koliko book zna poteza za ovu poziciju
-    static bool PRINT_BOOK_DEBUG = true;
-    int known = ExperienceBook::instance().debugKnownMovesCount(b.hash);
-
-    int hits = 0;
-    int sumBonus = 0;
-    int maxBonus = 0;
-
-    int sumBase = 0;
-    int sumAfter = 0;
-
+    // 2) dodaj prior bonus + ExperienceBook bonus (oboje ide u moves[i].score)
     for (int i = 0; i < n; ++i) {
-        // base score (bez book-a)
-        sumBase += moves[i].score;
-
         moves[i].score += positional_prior_bonus(b, moves[i]);
 
-        int bonus = ExperienceBook::instance().bonusForMove(b.hash, moves[i]);
-        if (bonus != 0) {
-            hits++;
-            sumBonus += bonus;
-            if (bonus > maxBonus) maxBonus = bonus;
-        }
-
-        // apply
-        moves[i].score += bonus;
-
-        // after score (sa book-om)
-        sumAfter += moves[i].score;
-    }
-
-    if (PRINT_BOOK_DEBUG && node && !node->hasMoveFromParent) {
-        std::cout << "info string BOOK knownMoves=" << known
-            << " hitsThisPos=" << hits
-            << " sumBonus=" << sumBonus
-            << " maxBonus=" << maxBonus
-            << "\n";
-
-        std::cout << "info string BOOK sumBaseScore=" << sumBase
-            << " sumAfterScore=" << sumAfter
-            << " delta=" << (sumAfter - sumBase)
-            << "\n";
+        int eb = ExperienceBook::instance().bonusForMove(b.hash, moves[i]);
+        moves[i].score += eb;
     }
 
     // 3) sortiraj ascending, pa pop_back daje najveći score prvo
@@ -384,14 +340,14 @@ void MctsSearch::ensureInitialized(MctsNode* node) {
     node->unexpanded = std::move(v);
     node->initialUnexpanded = (int)node->unexpanded.size();
 
-    // harmonic sum H_n = 1 + 1/2 + ... + 1/n  (da rank prior bude ~normalizovan)
+    // harmonic sum H_n = 1 + 1/2 + ... + 1/n
     double H = 0.0;
     for (int i = 1; i <= node->initialUnexpanded; ++i) H += 1.0 / (double)i;
     node->priorNorm = (H > 0.0) ? H : 1.0;
 
     node->initialized = true;
-
 }
+
 
 MctsNode* MctsSearch::selectChildUCB(MctsNode* node) const {
     if (!node || node->children.empty()) return nullptr;
@@ -401,7 +357,8 @@ MctsNode* MctsSearch::selectChildUCB(MctsNode* node) const {
     double bestScore = -std::numeric_limits<double>::infinity();
     MctsNode* bestChild = nullptr;
 
-    double logParent = std::log((double)node->visits + 1.0);
+    // Effective visit counts include inFlight (O) to reduce stampede in parallel/batched setting.
+    const int parentN = node->visits + node->inFlight;
 
     for (auto& ch : node->children) {
         MctsNode* c = ch.get();
@@ -415,9 +372,12 @@ MctsNode* MctsSearch::selectChildUCB(MctsNode* node) const {
         double p = c->prior;
         if (p < 1e-6) p = 1e-6;
 
-        double u = C * p * std::sqrt((double)node->visits + 1.0) / ((double)c->visits + 1.0);
+        const int childN = c->visits + c->inFlight;
 
-        // root max, opponent min (isto kao prije, samo sad je PUCT)
+        // PUCT exploration term (use effective visits)
+        double u = C * p * std::sqrt((double)parentN + 1.0) / ((double)childN + 1.0);
+
+        // root max, opponent min
         double score = (rootToMove ? q : -q) + u;
 
         if (score > bestScore) {
@@ -509,3 +469,156 @@ void MctsSearch::simulateOnce() {
     }
 }
 
+
+void MctsSearch::completeSimulation(const std::vector<MctsNode*>& path, double value) {
+    // path uključuje root..leaf
+    for (MctsNode* p : path) {
+        p->inFlight -= 1;
+        p->visits += 1;
+        p->valueSum += value;
+    }
+}
+
+void MctsSearch::reserveOneSimulation(std::vector<MctsNode*>& outPath,
+    Board& outLeafBoard,
+    bool& outIsTerminal,
+    int& outTerminalResult) {
+    outPath.clear();
+    outPath.reserve(128);
+
+    MctsNode* node = rootNode.get();
+    outPath.push_back(node);
+
+    while (true) {
+        ensureInitialized(node);
+
+        // Terminal
+        if (node->terminal) {
+            outIsTerminal = true;
+            outTerminalResult = node->terminalResult;
+
+            // rezerviši path (inFlight++)
+            for (MctsNode* p : outPath) p->inFlight += 1;
+
+            outLeafBoard = node->state;
+            return;
+        }
+
+        // Progressive widening treba gledati effective visits (visits+inFlight)
+        int k = progressive_limit(node->visits + node->inFlight);
+
+        // EXPAND samo ako je children < k
+        if (!node->unexpanded.empty() && (int)node->children.size() < k) {
+            // rank prior: prvi expand (najbolji) ima rank=0
+            int remaining_before_pop = (int)node->unexpanded.size();
+            int rank = node->initialUnexpanded - remaining_before_pop; // 0,1,2...
+
+            Move m = node->unexpanded.back();
+            node->unexpanded.pop_back();
+
+            Board childState = node->state;
+            pushMove(&childState, m);
+
+            auto child = std::make_unique<MctsNode>(childState);
+            child->moveFromParent = m;
+            child->hasMoveFromParent = true;
+
+            // PUCT prior (0..1), normalizovan
+            child->prior = (1.0 / (double)(rank + 1)) / node->priorNorm;
+
+            MctsNode* childPtr = child.get();
+            node->children.push_back(std::move(child));
+
+            node = childPtr;
+            outPath.push_back(node);
+
+            // rezerviši path (inFlight++)
+            for (MctsNode* p : outPath) p->inFlight += 1;
+
+            outIsTerminal = false;
+            outTerminalResult = UN_DETERMINED;
+            outLeafBoard = node->state;
+            return;
+        }
+
+        // SELECT
+        MctsNode* next = selectChildUCB(node);
+        if (!next) {
+            // nema djece (npr. stalemate / bug / fallback) -> evaluiraj ovaj node
+            // rezerviši path (inFlight++)
+            for (MctsNode* p : outPath) p->inFlight += 1;
+
+            outIsTerminal = false;
+            outTerminalResult = UN_DETERMINED;
+            outLeafBoard = node->state;
+            return;
+        }
+
+        node = next;
+        outPath.push_back(node);
+    }
+}
+
+void MctsSearch::runBatched() {
+    int done = 0;
+
+    // privremeni buffere (da ne alociramo stalno)
+    std::vector<std::vector<MctsNode*>> paths;
+    std::vector<Board> leafBoards;
+    std::vector<int> pendingMap; // map: index u paths -> index u leafBoards
+    std::vector<double> scores;
+
+    paths.reserve((size_t)batchSize);
+    leafBoards.reserve((size_t)batchSize);
+    pendingMap.reserve((size_t)batchSize);
+
+    while (done < iterations) {
+        const int cur = std::min(batchSize, iterations - done);
+
+        paths.clear();
+        leafBoards.clear();
+        pendingMap.clear();
+
+        paths.resize((size_t)cur);
+
+        // 1) Rezerviši cur simulacija (selection + opcionalni expand), bez evaluacije
+        for (int i = 0; i < cur; ++i) {
+            Board leaf{};
+            bool isTerm = false;
+            int termRes = UN_DETERMINED;
+
+            reserveOneSimulation(paths[(size_t)i], leaf, isTerm, termRes);
+
+            if (isTerm) {
+                // Terminal vrijednost odmah, nema GPU posla
+                double v = terminalValue(termRes);
+                completeSimulation(paths[(size_t)i], v);
+                // path ostaje tu ali je već kompletiran; nema potrebe da ide u pending
+            }
+            else {
+                // treba batch evaluacija
+                pendingMap.push_back(i);
+                leafBoards.push_back(leaf);
+            }
+        }
+
+        // 2) Batch evaluacija za sve ne-terminal leaf-ove
+        if (!leafBoards.empty()) {
+            scores.assign(leafBoards.size(), 0.0);
+
+            batchEvaluateRootPerspective(leafBoards.data(),
+                (int)leafBoards.size(),
+                rootTurn,
+                scores.data());
+
+            // 3) Backprop za batch rezultate
+            for (size_t j = 0; j < pendingMap.size(); ++j) {
+                const int pathIdx = pendingMap[j];
+                double v = scores[j];
+                completeSimulation(paths[(size_t)pathIdx], v);
+            }
+        }
+
+        done += cur;
+    }
+}
