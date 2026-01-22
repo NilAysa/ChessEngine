@@ -23,7 +23,7 @@ MctsSearch::MctsSearch(const Board& root, int rootTurn_, int iterations_)
 void MctsSearch::run() {
     // GPU-friendly batching: collect multiple leaf expansions and evaluate all children in one big batch.
     // This keeps tree logic on CPU, but maximizes GPU utilization in batchEvaluateRootPerspective(...).
-    constexpr int LEAF_BATCH = 64; // tune: 32..256 depending on GPU/CPU balance
+    constexpr int LEAF_BATCH = 1; // tune: 32..256 depending on GPU/CPU balance
 
     std::vector<std::vector<MctsNode*>> paths;
     std::vector<Board> leafStates;
