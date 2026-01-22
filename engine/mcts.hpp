@@ -57,11 +57,17 @@ private:
 
     double terminalValue(int gameResult) const;
     double staticEvalRootPerspective(const Board& b) const;
-    double evaluateLeaf_OnePlyMinimax(const Board& b);
+    double evaluateLeaf_OnePlyMinimax(const Board& b); // ostaje, ali više nije hot-path
     double qsearchCaptures(const Board& b, int depthLeft);
-
 
     MctsNode* selectChildUCB(MctsNode* node) const;
 
-    void simulateOnce();
+    // NEW: batching interface
+    void simulateOnceCollect(std::vector<MctsNode*>& path,
+        Board& outLeafState,
+        bool& outIsTerminal,
+        double& outTerminalVal);
+
+    void evaluateLeaves_OnePlyMinimaxBatch(const std::vector<Board>& leaves,
+        std::vector<double>& outVals);
 };

@@ -15,14 +15,64 @@
 static constexpr double PW_A = 1.5; // jačina widening-a (1.0–2.5 je normalno)
 
 
-MctsSearch::MctsSearch(const Board & root, int rootTurn_, int iterations_)
+MctsSearch::MctsSearch(const Board& root, int rootTurn_, int iterations_)
     : rootTurn(rootTurn_), iterations(iterations_) {
     rootNode = std::make_unique<MctsNode>(root);
 }
 
 void MctsSearch::run() {
-    for (int i = 0; i < iterations; ++i) {
-        simulateOnce();
+    // GPU-friendly batching: collect multiple leaf expansions and evaluate all children in one big batch.
+    // This keeps tree logic on CPU, but maximizes GPU utilization in batchEvaluateRootPerspective(...).
+    constexpr int LEAF_BATCH = 64; // tune: 32..256 depending on GPU/CPU balance
+
+    std::vector<std::vector<MctsNode*>> paths;
+    std::vector<Board> leafStates;
+    paths.reserve(LEAF_BATCH);
+    leafStates.reserve(LEAF_BATCH);
+
+    int done = 0;
+    while (done < iterations) {
+        paths.clear();
+        leafStates.clear();
+
+        // 1) Collect a batch of leaves (selection+expansion only)
+        while ((int)leafStates.size() < LEAF_BATCH && done < iterations) {
+            std::vector<MctsNode*> path;
+            path.reserve(128);
+            Board leaf{};
+            bool isTerminal = false;
+            double termVal = 0.0;
+
+            simulateOnceCollect(path, leaf, isTerminal, termVal);
+            ++done;
+
+            if (isTerminal) {
+                // terminal already evaluated -> immediate backprop
+                for (MctsNode* p : path) {
+                    p->visits += 1;
+                    p->valueSum += termVal;
+                }
+            }
+            else {
+                paths.push_back(std::move(path));
+                leafStates.push_back(leaf);
+            }
+        }
+
+        if (leafStates.empty()) continue;
+
+        // 2) Evaluate all collected leaves using one-ply minimax with ONE big batch-eval over ALL children.
+        std::vector<double> leafVals(leafStates.size(), 0.0);
+        evaluateLeaves_OnePlyMinimaxBatch(leafStates, leafVals);
+
+        // 3) Backprop values
+        for (size_t i = 0; i < leafVals.size(); ++i) {
+            double val = leafVals[i];
+            for (MctsNode* p : paths[i]) {
+                p->visits += 1;
+                p->valueSum += val;
+            }
+        }
     }
 }
 
@@ -157,7 +207,6 @@ double MctsSearch::evaluateLeaf_OnePlyMinimax(const Board& b) {
         }
     }
 
-
     if (!std::isfinite(best))
         best = staticEvalRootPerspective(tmp);
 
@@ -167,7 +216,6 @@ double MctsSearch::evaluateLeaf_OnePlyMinimax(const Board& b) {
     // blend: quiescence ima prednost jer je taktički stabilniji
     double out = 0.25 * best + 0.75 * q;
     return out;
-
 }
 
 static double clamp01(double x) {
@@ -217,7 +265,6 @@ double MctsSearch::qsearchCaptures(const Board& b, int depthLeft) {
     return best;
 }
 
-
 static inline int file_of(int sq) { return sq & 7; }      // 0..7
 static inline int rank_of(int sq) { return sq >> 3; }     // 0..7
 
@@ -265,49 +312,38 @@ static inline int positional_prior_bonus(const Board& b, const Move& m) {
         else bonus += 8; // čak i pomjeranje po ranku je nešto, ali manje
     }
 
-    // 3) Bonus za centralna polja
-    // strogi centar: d4 e4 d5 e5  (sq: 27,28,35,36 ako je a1=0)
-    if (to == 27 || to == 28 || to == 35 || to == 36) bonus += 14;
+    // 3) Bonus za centralna polja (d4,e4,d5,e5 približno)
+    const bool inCenter = (ft >= 2 && ft <= 5 && rt >= 2 && rt <= 5);
+    if (inCenter && (pt == 1 || pt == 2 || pt == 0)) bonus += 10;
 
-    // širi centar: c3..f6 okvir
-    if (ft >= 2 && ft <= 5 && rt >= 2 && rt <= 5) bonus += 6;
-
-    // 4) Penalizuj rani rook/queen “shuffle” sa početnih polja (osim ako je capture)
-    if (!isCapture) {
-        // bijeli: rooks a1/h1 (0/7), queen d1 (3)
-        // crni: rooks a8/h8 (56/63), queen d8 (59)
-        if (pt == 3) { // rook
-            if ((m.pieceType < 6 && (from == 0 || from == 7)) ||
-                (m.pieceType >= 6 && (from == 56 || from == 63))) {
-                bonus -= 14;
-            }
-        }
-        if (pt == 4) { // queen
-            if ((m.pieceType < 6 && from == 3) ||
-                (m.pieceType >= 6 && from == 59)) {
-                bonus -= 10;
-            }
-        }
+    // 4) Kazna za rano pomjeranje dame (ako nije capture)
+    if (pt == 4 && !isCapture) {
+        // ako je dama otišla sa početnog kvadrata u ranoj fazi, minus
+        // (heuristika lagana, jer MCTS svakako evaluira dalje)
+        bonus -= 8;
     }
 
-    // 5) Penalizuj “flank pawn push” a/h pješak rano (osim capture)
-    // bijeli pawn start rank 1, crni start rank 6
-    if (!isCapture && pt == 0) {
-        bool isFlank = (ff == 0 || ff == 7);
-        if (isFlank) {
-            if ((m.pieceType < 6 && rf == 1) || (m.pieceType >= 6 && rf == 6)) {
-                bonus -= 8; // blago, da ne ubije dobre planove
-            }
-        }
+    // 5) Rook na open/semi-open file (grubo)
+    if (pt == 3) {
+        // ako je na file-u bez sopstvenih pješaka, mali bonus
+        // (ovdje vrlo grubo, ali jeftino)
+        Bitboard ownPawns = (b.turn == WHITE) ? b.pawn_W : b.pawn_B;
+        int rookFile = ft;
+        Bitboard fileMask = 0;
+        for (int r = 0; r < 8; ++r) fileMask |= SQUARE_BITBOARDS[r * 8 + rookFile];
+        if ((ownPawns & fileMask) == 0) bonus += 6;
     }
-
-    // 6) Mali bonus za promociju (ako postoji u Move)
-    if (m.promotion != 0) bonus += 20;
 
     return bonus;
 }
 
-
+static inline int progressive_limit(int parentVisits) {
+    // Progressive widening: k = A * sqrt(visits)
+    double k = PW_A * std::sqrt((double)std::max(1, parentVisits));
+    int ki = (int)std::floor(k);
+    if (ki < 1) ki = 1;
+    return ki;
+}
 
 void MctsSearch::ensureInitialized(MctsNode* node) {
     if (!node || node->initialized) return;
@@ -331,48 +367,12 @@ void MctsSearch::ensureInitialized(MctsNode* node) {
     // 1) bazni ordering iz moveorderer-a (bez TT)
     score_moves(b, moves, n);
 
-    // DEBUG: koliko book zna poteza za ovu poziciju
-    static bool PRINT_BOOK_DEBUG = true;
-    int known = ExperienceBook::instance().debugKnownMovesCount(b.hash);
-
-    int hits = 0;
-    int sumBonus = 0;
-    int maxBonus = 0;
-
-    int sumBase = 0;
-    int sumAfter = 0;
-
+    // 2) ubaci heuristike + experience book bonus u moves[i].score
     for (int i = 0; i < n; ++i) {
-        // base score (bez book-a)
-        sumBase += moves[i].score;
-
         moves[i].score += positional_prior_bonus(b, moves[i]);
 
         int bonus = ExperienceBook::instance().bonusForMove(b.hash, moves[i]);
-        if (bonus != 0) {
-            hits++;
-            sumBonus += bonus;
-            if (bonus > maxBonus) maxBonus = bonus;
-        }
-
-        // apply
         moves[i].score += bonus;
-
-        // after score (sa book-om)
-        sumAfter += moves[i].score;
-    }
-
-    if (PRINT_BOOK_DEBUG && node && !node->hasMoveFromParent) {
-        std::cout << "info string BOOK knownMoves=" << known
-            << " hitsThisPos=" << hits
-            << " sumBonus=" << sumBonus
-            << " maxBonus=" << maxBonus
-            << "\n";
-
-        std::cout << "info string BOOK sumBaseScore=" << sumBase
-            << " sumAfterScore=" << sumAfter
-            << " delta=" << (sumAfter - sumBase)
-            << "\n";
     }
 
     // 3) sortiraj ascending, pa pop_back daje najveći score prvo
@@ -384,64 +384,45 @@ void MctsSearch::ensureInitialized(MctsNode* node) {
     node->unexpanded = std::move(v);
     node->initialUnexpanded = (int)node->unexpanded.size();
 
-    // harmonic sum H_n = 1 + 1/2 + ... + 1/n  (da rank prior bude ~normalizovan)
+    // harmonic sum H_n = 1 + 1/2 + ... + 1/n  (rank prior normalizacija)
     double H = 0.0;
     for (int i = 1; i <= node->initialUnexpanded; ++i) H += 1.0 / (double)i;
     node->priorNorm = (H > 0.0) ? H : 1.0;
 
     node->initialized = true;
-
 }
+
 
 MctsNode* MctsSearch::selectChildUCB(MctsNode* node) const {
-    if (!node || node->children.empty()) return nullptr;
+    if (!node) return nullptr;
+    if (node->children.empty()) return nullptr;
 
-    const bool rootToMove = (node->state.turn == rootTurn);
+    const double parentVisits = (double)std::max(1, node->visits);
 
+    MctsNode* best = nullptr;
     double bestScore = -std::numeric_limits<double>::infinity();
-    MctsNode* bestChild = nullptr;
 
-    double logParent = std::log((double)node->visits + 1.0);
+    for (auto& chPtr : node->children) {
+        MctsNode* ch = chPtr.get();
+        if (!ch) continue;
 
-    for (auto& ch : node->children) {
-        MctsNode* c = ch.get();
+        double q = (ch->visits > 0) ? (ch->valueSum / (double)ch->visits) : 0.0;
+        double u = C * ch->prior * std::sqrt(parentVisits) / (1.0 + (double)ch->visits);
 
-        double q = 0.0;
-        if (c->visits > 0)
-            q = (c->valueSum / (double)c->visits) / 600.0;   // 600 cp = ~1.0
-        if (q > 1.0) q = 1.0;
-        if (q < -1.0) q = -1.0;
-
-        double p = c->prior;
-        if (p < 1e-6) p = 1e-6;
-
-        double u = C * p * std::sqrt((double)node->visits + 1.0) / ((double)c->visits + 1.0);
-
-        // root max, opponent min (isto kao prije, samo sad je PUCT)
-        double score = (rootToMove ? q : -q) + u;
-
+        double score = q + u;
         if (score > bestScore) {
             bestScore = score;
-            bestChild = c;
+            best = ch;
         }
     }
-
-    return bestChild;
+    return best;
 }
 
-
-static inline int progressive_limit(int visits) {
-    // k = 1 + floor(a * sqrt(visits))
-    // visits=0 -> k=1, visits=1 -> k=2, visits=4 -> k=4 (za a=1.5)
-    int k = 1 + (int)std::floor(PW_A * std::sqrt((double)std::max(0, visits)));
-    return k;
-}
-
-
-void MctsSearch::simulateOnce() {
-    std::vector<MctsNode*> path;
-    path.reserve(128);
-
+void MctsSearch::simulateOnceCollect(std::vector<MctsNode*>& path,
+    Board& outLeafState,
+    bool& outIsTerminal,
+    double& outTerminalVal) {
+    path.clear();
     MctsNode* node = rootNode.get();
     path.push_back(node);
 
@@ -450,19 +431,15 @@ void MctsSearch::simulateOnce() {
 
         // Terminal
         if (node->terminal) {
-            double val = terminalValue(node->terminalResult);
-            for (MctsNode* p : path) {
-                p->visits += 1;
-                p->valueSum += val;
-            }
+            outIsTerminal = true;
+            outTerminalVal = terminalValue(node->terminalResult);
             return;
         }
 
         int k = progressive_limit(node->visits);
 
-        // EXPAND samo ako je children < k
+        // EXPAND only if children < k
         if (!node->unexpanded.empty() && (int)node->children.size() < k) {
-            // rank prior: prvi expand (najbolji) ima rank=0
             int remaining_before_pop = (int)node->unexpanded.size();
             int rank = node->initialUnexpanded - remaining_before_pop; // 0,1,2...
 
@@ -476,7 +453,6 @@ void MctsSearch::simulateOnce() {
             child->moveFromParent = m;
             child->hasMoveFromParent = true;
 
-            // PUCT prior (0..1), normalizovan
             child->prior = (1.0 / (double)(rank + 1)) / node->priorNorm;
 
             MctsNode* childPtr = child.get();
@@ -485,22 +461,16 @@ void MctsSearch::simulateOnce() {
             node = childPtr;
             path.push_back(node);
 
-            double val = evaluateLeaf_OnePlyMinimax(node->state);
-            for (MctsNode* p : path) {
-                p->visits += 1;
-                p->valueSum += val;
-            }
+            outIsTerminal = false;
+            outLeafState = node->state;
             return;
         }
 
         // SELECT
         MctsNode* next = selectChildUCB(node);
         if (!next) {
-            double val = evaluateLeaf_OnePlyMinimax(node->state);
-            for (MctsNode* p : path) {
-                p->visits += 1;
-                p->valueSum += val;
-            }
+            outIsTerminal = false;
+            outLeafState = node->state;
             return;
         }
 
@@ -509,3 +479,96 @@ void MctsSearch::simulateOnce() {
     }
 }
 
+// GPU-friendly: evaluate many leaves by flattening ALL their child boards into ONE big batch.
+// This maximizes GPU utilization (one kernel launch / one memcpy burst) instead of many small batches.
+void MctsSearch::evaluateLeaves_OnePlyMinimaxBatch(const std::vector<Board>& leaves,
+    std::vector<double>& outVals) {
+    const int L = (int)leaves.size();
+    outVals.assign((size_t)L, 0.0);
+
+    struct LeafInfo {
+        int childStart = 0;
+        int childCount = 0;
+        bool rootToMove = false;
+        bool terminal = false;
+        double terminalVal = 0.0;
+    };
+
+    std::vector<LeafInfo> info((size_t)L);
+    std::vector<Board> allChildren;
+    allChildren.reserve((size_t)L * 40); // rough average
+
+    // 1) Build flattened children list
+    for (int li = 0; li < L; ++li) {
+        Board tmp = leaves[(size_t)li];
+        Move moves[256];
+        int n = legalMoves(&tmp, moves);
+        int res = result(tmp, moves, n);
+        if (res != UN_DETERMINED) {
+            info[(size_t)li].terminal = true;
+            info[(size_t)li].terminalVal = terminalValue(res);
+            continue;
+        }
+
+        const bool rootToMove = (tmp.turn == rootTurn);
+        info[(size_t)li].rootToMove = rootToMove;
+        info[(size_t)li].childStart = (int)allChildren.size();
+        info[(size_t)li].childCount = n;
+
+        const int start = info[(size_t)li].childStart;
+        allChildren.resize((size_t)start + (size_t)n);
+
+        // parallelize per-leaf move application on CPU (feeds GPU faster)
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+        for (int i = 0; i < n; ++i) {
+            allChildren[(size_t)start + (size_t)i] = tmp;
+            pushMove(&allChildren[(size_t)start + (size_t)i], moves[i]);
+        }
+    }
+
+    // 2) Batch evaluate all children at once (GPU path inside batchEvaluateRootPerspective)
+    std::vector<double> childScores(allChildren.size(), 0.0);
+    if (!allChildren.empty()) {
+        batchEvaluateRootPerspective(allChildren.data(), (int)allChildren.size(), rootTurn, childScores.data());
+    }
+
+    // 3) Reduce childScores -> leaf value (minimax) + qsearchCaptures, then blend
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int li = 0; li < L; ++li) {
+        if (info[(size_t)li].terminal) {
+            outVals[(size_t)li] = info[(size_t)li].terminalVal;
+            continue;
+        }
+
+        const int start = info[(size_t)li].childStart;
+        const int n = info[(size_t)li].childCount;
+        const bool rootToMove = info[(size_t)li].rootToMove;
+
+        double best = rootToMove
+            ? -std::numeric_limits<double>::infinity()
+            : std::numeric_limits<double>::infinity();
+
+        for (int i = 0; i < n; ++i) {
+            double v = childScores[(size_t)start + (size_t)i];
+            if (rootToMove) {
+                if (v > best) best = v;
+            }
+            else {
+                if (v < best) best = v;
+            }
+        }
+
+        if (!std::isfinite(best)) {
+            best = staticEvalRootPerspective(leaves[(size_t)li]);
+        }
+
+        // quiescence-light (4 ply capture-only)
+        double q = qsearchCaptures(leaves[(size_t)li], 4);
+        double out = 0.25 * best + 0.75 * q;
+        outVals[(size_t)li] = out;
+    }
+}
