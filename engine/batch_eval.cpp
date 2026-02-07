@@ -23,7 +23,7 @@ void batchEvaluateRootPerspective(const Board* boards, int n, int rootTurn, doub
     }
 
     // Prag: ispod ovoga često je CPU brži (GPU overhead)
-    constexpr int GPU_THRESHOLD = 1;
+    constexpr int GPU_THRESHOLD = 32;
 
     // 25% NNUE, 75% classic (identično evaluateLeaf u evaluation.cpp)
     constexpr int a = 250; // permille
