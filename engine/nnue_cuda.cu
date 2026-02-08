@@ -36,18 +36,44 @@ __device__ __constant__ int c_ROOK_PST[64];
 __device__ __constant__ int c_QUEEN_PST[64];
 __device__ __constant__ int c_KING_PST[64];
 
-// --- device buffers for input/output (resizable) ---
-static Board* d_boards = nullptr;
-static int*   d_outCp  = nullptr;
-static int    cap      = 0;
+// ------------------------------
+// PackedBoard: manji payload za H2D (promjena #5)
+// ------------------------------
+struct PackedBoard {
+    Bitboard pawn_W, knight_W, bishop_W, rook_W, queen_W, king_W;
+    Bitboard pawn_B, knight_B, bishop_B, rook_B, queen_B, king_B;
+    int turn;
+    int castling;
+    int epSquare;
+    int whiteKingSq;
+    int blackKingSq;
+};
 
-// --- host pinned staging buffers (for true async memcpy) ---
-static Board* h_boardsPinned = nullptr;
-static int*   h_outPinned    = nullptr;
-static int    h_cap          = 0;
+static inline PackedBoard packBoardHost(const Board& b) {
+    PackedBoard p{};
+    p.pawn_W = b.pawn_W;   p.knight_W = b.knight_W; p.bishop_W = b.bishop_W; p.rook_W = b.rook_W; p.queen_W = b.queen_W; p.king_W = b.king_W;
+    p.pawn_B = b.pawn_B;   p.knight_B = b.knight_B; p.bishop_B = b.bishop_B; p.rook_B = b.rook_B; p.queen_B = b.queen_B; p.king_B = b.king_B;
+    p.turn = b.turn;
+    p.castling = b.castling;
+    p.epSquare = b.epSquare;
+    p.whiteKingSq = b.whiteKingSq;
+    p.blackKingSq = b.blackKingSq;
+    return p;
+}
 
-// --- one persistent stream ---
-static cudaStream_t g_stream = nullptr;
+// ------------------------------
+// Double-buffered device + pinned host buffers (promjena #4)
+// ------------------------------
+static PackedBoard* d_boards[2] = { nullptr, nullptr };
+static int*         d_outCp[2]  = { nullptr, nullptr };
+static int          cap[2]      = { 0, 0 };
+
+static PackedBoard* h_boardsPinned[2] = { nullptr, nullptr };
+static int*         h_outPinned[2]    = { nullptr, nullptr };
+static int          h_cap[2]          = { 0, 0 };
+
+static cudaStream_t g_stream[2] = { nullptr, nullptr };
+static int g_rr = 0; // round-robin buffer index
 
 static bool g_inited = false;
 
@@ -55,8 +81,7 @@ static __device__ __forceinline__ float relu(float x) { return x > 0.0f ? x : 0.
 static __device__ __forceinline__ int mirrorSqDev(int sq) { return 63 - sq; }
 
 // --- classic eval (device) ---
-// NOTE: must match evaluation.cpp (material + PST)
-static __device__ __forceinline__ int evalClassicWhitePerspectiveDev(const Board& b) {
+static __device__ __forceinline__ int evalClassicWhitePerspectiveDev(const PackedBoard& b) {
     int eval = 0;
 
     auto addWhite = [&](Bitboard bb, int valAbs, const int* pst) {
@@ -90,18 +115,17 @@ static __device__ __forceinline__ int evalClassicWhitePerspectiveDev(const Board
     addBlack(b.rook_B,   500, c_ROOK_PST);
     addBlack(b.queen_B,  900, c_QUEEN_PST);
 
-    // king PST special-case (same as evaluation.cpp)
+    // king PST special-case
     eval += c_KING_PST[b.whiteKingSq];
     eval -= c_KING_PST[mirrorSqDev(b.blackKingSq)];
 
-    // clamp like evaluation.cpp bounds
     if (eval >  100000) eval =  100000;
     if (eval < -100000) eval = -100000;
     return eval;
 }
 
-// Build sparse active feature indices (same logic as your existing code)
-__device__ __forceinline__ int buildActive(const Board& b, int* act) {
+// Build sparse active feature indices (same logic)
+__device__ __forceinline__ int buildActive(const PackedBoard& b, int* act) {
     int cnt = 0;
 
     auto addPiecesPlane = [&](Bitboard bb, int base) {
@@ -136,7 +160,7 @@ __device__ __forceinline__ int buildActive(const Board& b, int* act) {
     if (b.castling & 0b0100) act[cnt++] = 771;
     if (b.castling & 0b1000) act[cnt++] = 772;
 
-    // en-passant file (if exists) => 773..780 (8 files)
+    // en-passant file => 773..780
     if (b.epSquare >= 0 && b.epSquare < 64) {
         int file = b.epSquare & 7;
         act[cnt++] = 773 + file;
@@ -145,7 +169,7 @@ __device__ __forceinline__ int buildActive(const Board& b, int* act) {
     return cnt;
 }
 
-__global__ void nnueBatchBlendedKernel(const Board* boards, int n,
+__global__ void nnueBatchBlendedKernel(const PackedBoard* boards, int n,
                                        const float* W1, const float* B1,
                                        const float* W2, const float* B2,
                                        int blendPermille,
@@ -156,19 +180,18 @@ __global__ void nnueBatchBlendedKernel(const Board* boards, int n,
 
     int i = (int)threadIdx.x; // 0..127
 
-    __shared__ int   act[64];     // max active features
+    __shared__ int   act[64];
     __shared__ int   actCount;
     __shared__ float hidden[NNUE_HIDDEN_DIM];
     __shared__ int   classicEval;
 
     if (i == 0) {
-        const Board& b = boards[pos];
+        const PackedBoard& b = boards[pos];
         classicEval = evalClassicWhitePerspectiveDev(b);
         actCount = buildActive(b, act);
     }
     __syncthreads();
 
-    // Hidden neuron i: dot over sparse act
     float sum = B1[i];
     for (int k = 0; k < actCount; ++k) {
         int idx = act[k];
@@ -181,13 +204,11 @@ __global__ void nnueBatchBlendedKernel(const Board* boards, int n,
         float out = B2[0];
         for (int j = 0; j < NNUE_HIDDEN_DIM; ++j) out += W2[j] * hidden[j];
 
-        // same scaling/clamp as nnue.cpp
         float nnCpF = out * 400.0f;
         if (nnCpF >  100000.0f) nnCpF =  100000.0f;
         if (nnCpF < -100000.0f) nnCpF = -100000.0f;
         int nnCp = (int)llroundf(nnCpF);
 
-        // blend like evaluateLeaf() and batch_eval.cpp
         int a = blendPermille;
         if (a < 0) a = 0;
         if (a > 1000) a = 1000;
@@ -207,8 +228,9 @@ bool nnueCudaInit() {
     if (!ck(cudaGetDeviceCount(&devCount), "cudaGetDeviceCount")) return false;
     if (devCount == 0) return false;
 
-    // stream
-    if (!ck(cudaStreamCreate(&g_stream), "cudaStreamCreate")) return false;
+    // streams (double-buffer)
+    if (!ck(cudaStreamCreate(&g_stream[0]), "cudaStreamCreate stream0")) return false;
+    if (!ck(cudaStreamCreate(&g_stream[1]), "cudaStreamCreate stream1")) return false;
 
     // allocate NNUE weights on device
     if (!ck(cudaMalloc(&d_W1, sizeof(float) * NNUE_HIDDEN_DIM * NNUE_INPUT_DIM), "malloc d_W1")) return false;
@@ -221,7 +243,7 @@ bool nnueCudaInit() {
     if (!ck(cudaMemcpy(d_W2, NNUE_W2, sizeof(float) * NNUE_HIDDEN_DIM, cudaMemcpyHostToDevice), "cpy W2")) return false;
     if (!ck(cudaMemcpy(d_B2, &NNUE_B2, sizeof(float), cudaMemcpyHostToDevice), "cpy B2")) return false;
 
-    // upload PSTs to constant memory (classic eval on GPU)
+    // upload PSTs to constant memory
     if (!ck(cudaMemcpyToSymbol(c_PAWN_PST,   PAWN_W_PST,   sizeof(int) * 64), "cpy PST pawn")) return false;
     if (!ck(cudaMemcpyToSymbol(c_KNIGHT_PST, KNIGHT_W_PST, sizeof(int) * 64), "cpy PST knight")) return false;
     if (!ck(cudaMemcpyToSymbol(c_BISHOP_PST, BISHOP_W_PST, sizeof(int) * 64), "cpy PST bishop")) return false;
@@ -230,7 +252,7 @@ bool nnueCudaInit() {
     if (!ck(cudaMemcpyToSymbol(c_KING_PST,   KING_W_PST,   sizeof(int) * 64), "cpy PST king")) return false;
 
     g_inited = true;
-    std::printf("[CUDA] NNUE CUDA init OK (stream + persistent buffers + PST const)\n");
+    std::printf("[CUDA] NNUE CUDA init OK (2 streams + double buffers + PST const)\n");
     return true;
 }
 
@@ -240,111 +262,114 @@ void nnueCudaShutdown() {
     if (d_W2) cudaFree(d_W2), d_W2 = nullptr;
     if (d_B2) cudaFree(d_B2), d_B2 = nullptr;
 
-    if (d_boards) cudaFree(d_boards), d_boards = nullptr;
-    if (d_outCp)  cudaFree(d_outCp),  d_outCp  = nullptr;
+    for (int i = 0; i < 2; ++i) {
+        if (d_boards[i]) cudaFree(d_boards[i]), d_boards[i] = nullptr;
+        if (d_outCp[i])  cudaFree(d_outCp[i]),  d_outCp[i]  = nullptr;
 
-    if (h_boardsPinned) cudaFreeHost(h_boardsPinned), h_boardsPinned = nullptr;
-    if (h_outPinned)    cudaFreeHost(h_outPinned),    h_outPinned    = nullptr;
+        if (h_boardsPinned[i]) cudaFreeHost(h_boardsPinned[i]), h_boardsPinned[i] = nullptr;
+        if (h_outPinned[i])    cudaFreeHost(h_outPinned[i]),    h_outPinned[i]    = nullptr;
 
-    cap = 0;
-    h_cap = 0;
+        cap[i] = 0;
+        h_cap[i] = 0;
 
-    if (g_stream) cudaStreamDestroy(g_stream), g_stream = nullptr;
+        if (g_stream[i]) cudaStreamDestroy(g_stream[i]), g_stream[i] = nullptr;
+    }
 
     g_inited = false;
 }
 
-// Evaluate NNUE for a batch of boards, returns WHITE-perspective cp
-bool nnueCudaEvaluateBatchWhite(const Board* boards, int n, int* outCp) {
-    if (!g_inited) return false;
-    if (n <= 0) return true;
+// ------------------------------
+// Helpers
+// ------------------------------
+static bool ensureCapacity(int idx, int n) {
+    if (n > cap[idx]) {
+        if (d_boards[idx]) cudaFree(d_boards[idx]), d_boards[idx] = nullptr;
+        if (d_outCp[idx])  cudaFree(d_outCp[idx]),  d_outCp[idx]  = nullptr;
 
-    // Resize device buffers
-    if (n > cap) {
-        if (d_boards) cudaFree(d_boards);
-        if (d_outCp)  cudaFree(d_outCp);
-
-        if (!ck(cudaMalloc(&d_boards, sizeof(Board) * n), "malloc d_boards")) return false;
-        if (!ck(cudaMalloc(&d_outCp,  sizeof(int)   * n), "malloc d_outCp"))  return false;
-
-        cap = n;
+        if (!ck(cudaMalloc(&d_boards[idx], sizeof(PackedBoard) * n), "malloc d_boards")) return false;
+        if (!ck(cudaMalloc(&d_outCp[idx],  sizeof(int)        * n), "malloc d_outCp"))  return false;
+        cap[idx] = n;
     }
 
-    // Resize pinned host staging (for true async H2D/D2H)
-    if (n > h_cap) {
-        if (h_boardsPinned) cudaFreeHost(h_boardsPinned);
-        if (h_outPinned)    cudaFreeHost(h_outPinned);
+    if (n > h_cap[idx]) {
+        if (h_boardsPinned[idx]) cudaFreeHost(h_boardsPinned[idx]), h_boardsPinned[idx] = nullptr;
+        if (h_outPinned[idx])    cudaFreeHost(h_outPinned[idx]),    h_outPinned[idx]    = nullptr;
 
-        if (!ck(cudaMallocHost(&h_boardsPinned, sizeof(Board) * n), "cudaMallocHost boards")) return false;
-        if (!ck(cudaMallocHost(&h_outPinned,    sizeof(int)   * n), "cudaMallocHost out"))    return false;
-        h_cap = n;
+        if (!ck(cudaMallocHost(&h_boardsPinned[idx], sizeof(PackedBoard) * n), "cudaMallocHost boards")) return false;
+        if (!ck(cudaMallocHost(&h_outPinned[idx],    sizeof(int)        * n), "cudaMallocHost out"))    return false;
+        h_cap[idx] = n;
     }
 
-    // Copy to pinned staging (CPU memcpy)
-    std::memcpy(h_boardsPinned, boards, sizeof(Board) * n);
-
-    // Async H2D
-    if (!ck(cudaMemcpyAsync(d_boards, h_boardsPinned, sizeof(Board) * n, cudaMemcpyHostToDevice, g_stream),
-            "cudaMemcpyAsync H2D boards")) return false;
-
-    // Kernel (NNUE-only): reuse blended kernel with blendPermille=1000
-    dim3 block(NNUE_HIDDEN_DIM, 1, 1);
-    dim3 grid(n, 1, 1);
-    nnueBatchBlendedKernel<<<grid, block, 0, g_stream>>>(d_boards, n, d_W1, d_B1, d_W2, d_B2, 1000, d_outCp);
-    if (!ck(cudaGetLastError(), "kernel launch")) return false;
-
-    // Async D2H
-    if (!ck(cudaMemcpyAsync(h_outPinned, d_outCp, sizeof(int) * n, cudaMemcpyDeviceToHost, g_stream),
-            "cudaMemcpyAsync D2H out")) return false;
-
-    // Wait only for this stream (no global device sync)
-    if (!ck(cudaStreamSynchronize(g_stream), "cudaStreamSynchronize")) return false;
-
-    std::memcpy(outCp, h_outPinned, sizeof(int) * n);
     return true;
 }
 
-// Evaluate blended classic+NNUE on GPU, returns WHITE-perspective cp
-bool nnueCudaEvaluateBatchBlendedWhite(const Board* boards, int n, int blendPermille, int* outCp) {
+// ------------------------------
+// Async API (submit/collect)
+// ------------------------------
+bool nnueCudaSubmitBatchBlendedWhite(const Board* boards, int n, int blendPermille, CudaBatchHandle& outHandle) {
     if (!g_inited) return false;
-    if (n <= 0) return true;
-
-    // Resize device buffers
-    if (n > cap) {
-        if (d_boards) cudaFree(d_boards);
-        if (d_outCp)  cudaFree(d_outCp);
-
-        if (!ck(cudaMalloc(&d_boards, sizeof(Board) * n), "malloc d_boards")) return false;
-        if (!ck(cudaMalloc(&d_outCp,  sizeof(int)   * n), "malloc d_outCp"))  return false;
-
-        cap = n;
+    if (n <= 0) {
+        outHandle.n = 0;
+        outHandle.bufferIndex = 0;
+        outHandle.done = nullptr;
+        return true;
     }
 
-    // Resize pinned host staging
-    if (n > h_cap) {
-        if (h_boardsPinned) cudaFreeHost(h_boardsPinned);
-        if (h_outPinned)    cudaFreeHost(h_outPinned);
+    const int idx = (g_rr++ & 1);
+    if (!ensureCapacity(idx, n)) return false;
 
-        if (!ck(cudaMallocHost(&h_boardsPinned, sizeof(Board) * n), "cudaMallocHost boards")) return false;
-        if (!ck(cudaMallocHost(&h_outPinned,    sizeof(int)   * n), "cudaMallocHost out"))    return false;
-        h_cap = n;
+    // Pack -> pinned (manji payload)
+    for (int i = 0; i < n; ++i) {
+        h_boardsPinned[idx][i] = packBoardHost(boards[i]);
     }
 
-    std::memcpy(h_boardsPinned, boards, sizeof(Board) * n);
+    cudaStream_t s = g_stream[idx];
 
-    if (!ck(cudaMemcpyAsync(d_boards, h_boardsPinned, sizeof(Board) * n, cudaMemcpyHostToDevice, g_stream),
+    if (!ck(cudaMemcpyAsync(d_boards[idx], h_boardsPinned[idx], sizeof(PackedBoard) * n, cudaMemcpyHostToDevice, s),
             "cudaMemcpyAsync H2D boards")) return false;
 
     dim3 block(NNUE_HIDDEN_DIM, 1, 1);
     dim3 grid(n, 1, 1);
-    nnueBatchBlendedKernel<<<grid, block, 0, g_stream>>>(d_boards, n, d_W1, d_B1, d_W2, d_B2, blendPermille, d_outCp);
+    nnueBatchBlendedKernel<<<grid, block, 0, s>>>(d_boards[idx], n, d_W1, d_B1, d_W2, d_B2, blendPermille, d_outCp[idx]);
     if (!ck(cudaGetLastError(), "kernel launch")) return false;
 
-    if (!ck(cudaMemcpyAsync(h_outPinned, d_outCp, sizeof(int) * n, cudaMemcpyDeviceToHost, g_stream),
+    if (!ck(cudaMemcpyAsync(h_outPinned[idx], d_outCp[idx], sizeof(int) * n, cudaMemcpyDeviceToHost, s),
             "cudaMemcpyAsync D2H out")) return false;
 
-    if (!ck(cudaStreamSynchronize(g_stream), "cudaStreamSynchronize")) return false;
+    cudaEvent_t ev;
+    if (!ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate")) return false;
+    if (!ck(cudaEventRecord(ev, s), "cudaEventRecord")) return false;
 
-    std::memcpy(outCp, h_outPinned, sizeof(int) * n);
+    outHandle.done = ev;
+    outHandle.n = n;
+    outHandle.bufferIndex = idx;
     return true;
+}
+
+bool nnueCudaCollectBatch(CudaBatchHandle& handle, int* outCp) {
+    if (!g_inited) return false;
+    if (handle.n <= 0) return true;
+
+    const int idx = handle.bufferIndex & 1;
+    if (!handle.done) return false;
+
+    if (!ck(cudaEventSynchronize(handle.done), "cudaEventSynchronize")) return false;
+    cudaEventDestroy(handle.done);
+    handle.done = nullptr;
+
+    std::memcpy(outCp, h_outPinned[idx], sizeof(int) * handle.n);
+    return true;
+}
+
+// ------------------------------
+// Backwards compatible synchronous wrappers
+// ------------------------------
+bool nnueCudaEvaluateBatchBlendedWhite(const Board* boards, int n, int blendPermille, int* outCp) {
+    CudaBatchHandle h{};
+    if (!nnueCudaSubmitBatchBlendedWhite(boards, n, blendPermille, h)) return false;
+    return nnueCudaCollectBatch(h, outCp);
+}
+
+bool nnueCudaEvaluateBatchWhite(const Board* boards, int n, int* outCp) {
+    return nnueCudaEvaluateBatchBlendedWhite(boards, n, 1000, outCp);
 }
