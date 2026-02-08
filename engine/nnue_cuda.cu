@@ -162,9 +162,11 @@ __device__ __forceinline__ int buildActive(const PackedBoard& b, int* act) {
 
     // en-passant file => 773..780
     if (b.epSquare >= 0 && b.epSquare < 64) {
-        int file = b.epSquare & 7;
-        act[cnt++] = 773 + file;
+        int file_engine = b.epSquare & 7;   // 0=h ... 7=a (kao na CPU)
+        int file_py = 7 - file_engine;      // 0=a ... 7=h
+        act[cnt++] = 773 + file_py;
     }
+
 
     return cnt;
 }
