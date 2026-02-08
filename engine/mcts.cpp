@@ -562,27 +562,15 @@ void MctsSearch::reserveOneSimulation(std::vector<MctsNode*>& outPath,
 void MctsSearch::runBatched() {
     int done = 0;
 
-    // Double-buffer: dok GPU evaluira batch "prev", CPU može da gradi batch "cur".
-    // Ovo smanjuje idle vrijeme i pravi vidljiviju razliku GPU vs CPU (promjena #4).
-
-    // prev buffers (in-flight evaluation)
-    std::vector<std::vector<MctsNode*>> prevPaths;
-    std::vector<int> prevPendingMap;
-    std::vector<double> prevScores;
-    BatchEvalHandle prevHandle{};
-    bool hasPrev = false;
-
-    // cur buffers (to be submitted)
     std::vector<std::vector<MctsNode*>> paths;
     std::vector<Board> leafBoards;
     std::vector<int> pendingMap;
+    std::vector<double> scores;
 
     paths.reserve((size_t)batchSize);
     leafBoards.reserve((size_t)batchSize);
     pendingMap.reserve((size_t)batchSize);
-
-    prevPaths.reserve((size_t)batchSize);
-    prevPendingMap.reserve((size_t)batchSize);
+    scores.reserve((size_t)batchSize);
 
     while (done < iterations) {
         const int cur = std::min(batchSize, iterations - done);
@@ -592,7 +580,7 @@ void MctsSearch::runBatched() {
         pendingMap.clear();
         paths.resize((size_t)cur);
 
-        // 1) CPU: rezerviši cur simulacija (selection + opcionalni expand), bez evaluacije
+        // 1) reserve
         for (int i = 0; i < cur; ++i) {
             Board leaf{};
             bool isTerm = false;
@@ -610,43 +598,21 @@ void MctsSearch::runBatched() {
             }
         }
 
-        // 2) Dok GPU radi prethodni batch, tek sada čekamo i backprop-ujemo njegov rezultat.
-        if (hasPrev) {
-            prevScores.assign(prevPendingMap.size(), 0.0);
-            batchEvaluateRootPerspectiveCollect(prevHandle, prevScores.data());
-
-            for (size_t j = 0; j < prevPendingMap.size(); ++j) {
-                const int pathIdx = prevPendingMap[j];
-                double v = prevScores[j];
-                completeSimulation(prevPaths[(size_t)pathIdx], v);
-            }
-
-            hasPrev = false;
+        // 2) eval (sync wrapper koristi GPU async ispod haube, ali čeka)
+        scores.assign(leafBoards.size(), 0.0);
+        if (!leafBoards.empty()) {
+            batchEvaluateRootPerspective(leafBoards.data(), (int)leafBoards.size(), rootTurn, scores.data());
         }
 
-        // 3) Submit evaluaciju za trenutni batch (async). Rezultat dolazi u sljedećoj iteraciji.
-        if (!leafBoards.empty()) {
-            prevHandle = BatchEvalHandle{};
-            batchEvaluateRootPerspectiveAsync(leafBoards.data(), (int)leafBoards.size(), rootTurn, prevHandle);
-
-            prevPaths.swap(paths);
-            prevPendingMap.swap(pendingMap);
-            hasPrev = true;
+        // 3) complete
+        for (size_t j = 0; j < pendingMap.size(); ++j) {
+            const int pathIdx = pendingMap[j];
+            double v = scores[j];
+            completeSimulation(paths[(size_t)pathIdx], v);
         }
 
         done += cur;
     }
-
-    // Flush zadnji in-flight batch
-    if (hasPrev) {
-        prevScores.assign(prevPendingMap.size(), 0.0);
-        batchEvaluateRootPerspectiveCollect(prevHandle, prevScores.data());
-
-        for (size_t j = 0; j < prevPendingMap.size(); ++j) {
-            const int pathIdx = prevPendingMap[j];
-            double v = prevScores[j];
-            completeSimulation(prevPaths[(size_t)pathIdx], v);
-        }
-    }
 }
+
 
