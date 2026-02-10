@@ -327,8 +327,11 @@ void MctsSearch::ensureInitialized(MctsNode* node) {
     for (int i = 0; i < n; ++i) {
         moves[i].score += positional_prior_bonus(b, moves[i]);
 
-        int eb = ExperienceBook::instance().bonusForMove(b.hash, moves[i]);
-        moves[i].score += eb;
+    #if USE_EXPERIENCE_BOOK
+            int eb = ExperienceBook::instance().bonusForMove(b.hash, moves[i]);
+            moves[i].score += eb;
+    #endif
+
     }
 
     // 3) sortiraj ascending, pa pop_back daje najveći score prvo

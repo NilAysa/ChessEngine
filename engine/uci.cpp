@@ -31,8 +31,12 @@ int main() {
     initMoveGeneration();
     initEvaluation();
     initNNUE();
-    std::cout << "info string book file: experience_book.bin\n";
-    ExperienceBook::instance().load("experience_book.bin");
+    #if USE_EXPERIENCE_BOOK
+        std::cout << "info string book file: experience_book.bin\n";
+        ExperienceBook::instance().load("experience_book.bin");
+    #else
+        std::cout << "info string book disabled\n";
+    #endif
 
 
     std::cin.sync_with_stdio(false);
@@ -84,8 +88,11 @@ int main() {
             getBestMove(board, depth);
         }
         else if (command.rfind("quit", 0) == 0) {
-            std::cout << "info string book file: experience_book.bin\n";
-            ExperienceBook::instance().save("experience_book.bin");
+        #if USE_EXPERIENCE_BOOK
+                    std::cout << "info string book file: experience_book.bin\n";
+                    ExperienceBook::instance().save("experience_book.bin");
+        #endif
+
             break;
         }
         else if (command.rfind("uci", 0) == 0) {

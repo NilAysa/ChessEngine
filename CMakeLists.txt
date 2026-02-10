@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 project(ChessSophiaCpp CXX)
 
 option(USE_CUDA_NNUE "Enable CUDA NNUE batch eval" OFF)
+option(USE_EXPERIENCE_BOOK "Enable ExperienceBook influence" OFF)
+
 
 if (USE_CUDA_NNUE)
   enable_language(CUDA)
@@ -31,6 +33,13 @@ add_executable(chess_sophia
     engine/batch_eval.cpp
     engine/nnue.cpp
 )
+# ExperienceBook toggle
+if (USE_EXPERIENCE_BOOK)
+    target_compile_definitions(chess_sophia PRIVATE USE_EXPERIENCE_BOOK=1)
+else()
+    target_compile_definitions(chess_sophia PRIVATE USE_EXPERIENCE_BOOK=0)
+endif()
+
 
 # Add CUDA file only when enabled
 if (USE_CUDA_NNUE)

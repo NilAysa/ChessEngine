@@ -26,18 +26,22 @@ int search(Board board, int depth) {
     SEARCH_NODES_SEARCHED = iterations;
 
     // BOOK update
-    std::vector<BookChildStat> stats = mcts.rootChildStats();
+    #if USE_EXPERIENCE_BOOK
+        // BOOK update
+        std::vector<BookChildStat> stats = mcts.rootChildStats();
 
-    std::cout << "info string BOOKDBG hash=" << board.hash
-        << " rootChildrenStats=" << (int)stats.size()
-        << " storedBefore=" << ExperienceBook::instance().positionsStored()
-        << "\n";
+        std::cout << "info string BOOKDBG hash=" << board.hash
+            << " rootChildrenStats=" << (int)stats.size()
+            << " storedBefore=" << ExperienceBook::instance().positionsStored()
+            << "\n";
 
-    ExperienceBook::instance().updateFromRootStats(board.hash, stats);
+        ExperienceBook::instance().updateFromRootStats(board.hash, stats);
 
-    std::cout << "info string BOOKDBG storedAfter="
-        << ExperienceBook::instance().positionsStored()
-        << "\n";
+        std::cout << "info string BOOKDBG storedAfter="
+            << ExperienceBook::instance().positionsStored()
+            << "\n";
+    #endif
+
 
     return mcts.bestChildScoreCp();
 }
