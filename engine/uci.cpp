@@ -14,6 +14,7 @@
 #include "evaluation.hpp"
 #include "experience.hpp"
 #include "nnue.hpp"
+#include <chrono> 
 
 
 void parsePosition(const std::string& command, Board* board);
@@ -123,25 +124,31 @@ void parsePosition(const std::string& command, Board* board) {
     board->hash = hash(*board);
 }
 
+
 void getBestMove(Board board, int depth) {
-    std::clock_t start = std::clock();
+    auto t0 = std::chrono::steady_clock::now();
 
     int eval = search(board, depth);
 
-    std::clock_t end = std::clock();
-    double time_ms =
-        static_cast<double>(end - start) / CLOCKS_PER_SEC * 1000.0;
+    auto t1 = std::chrono::steady_clock::now();
+    auto time_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+
+    // opcionalno: nps (kod tebe je "nodes" = iterations)
+    long long nodes = SEARCH_NODES_SEARCHED;
+    long long nps = (time_ms > 0) ? (nodes * 1000LL / time_ms) : 0;
 
     std::cout << "info depth " << depth
-        << " time " << static_cast<int>(time_ms)
-        << " nodes " << SEARCH_NODES_SEARCHED
-        << " score cp " << eval
-        << "\n";
+              << " time " << time_ms
+              << " nodes " << nodes
+              << " nps " << nps
+              << " score cp " << eval
+              << "\n";
 
     char san[6]{};
     moveToSan(SEARCH_BEST_MOVE, san);
     std::cout << "bestmove " << san << "\n";
 }
+
 
 void printEngineInfo() {
     std::cout << "uciok\n";
